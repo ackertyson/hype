@@ -196,7 +196,7 @@ pub fn render_ascii(
     bg: Option<(u8, u8, u8)>,
 ) -> String {
     let pixels = apply_bg(pixels, bg);
-    let ramp: &[u8] = b" .:-=+*%#@";
+    let ramp: &[u8] = b" .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
     let mut out = String::new();
     let mut last_fg: Option<(u8, u8, u8)> = None;
 
