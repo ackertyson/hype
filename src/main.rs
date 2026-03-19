@@ -26,18 +26,15 @@ fn main() {
         return;
     }
 
-    let path = match &opts.image {
-        Some(p) => p.clone(),
-        None => {
-            eprintln!("hype: no image specified (use -h for help)");
-            process::exit(1);
-        }
-    };
+    let path = opts.image.as_deref().unwrap_or_else(|| {
+        eprintln!("hype: no image specified (use -h for help)");
+        process::exit(1);
+    });
 
-    let img = match image::open(&path) {
+    let img = match image::open(path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("hype: cannot open '{}': {}", path, e);
+            eprintln!("hype: cannot open '{path}': {e}");
             process::exit(1);
         }
     };
@@ -128,10 +125,10 @@ struct Opts {
 /// Detect terminal color support from environment variables.
 fn detect_color_support() -> ColorMode {
     // COLORTERM=truecolor or 24bit indicates 24-bit color support
-    if let Ok(ct) = std::env::var("COLORTERM") {
-        if ct == "truecolor" || ct == "24bit" {
-            return ColorMode::True;
-        }
+    if let Ok(ct) = std::env::var("COLORTERM")
+        && (ct == "truecolor" || ct == "24bit")
+    {
+        return ColorMode::True;
     }
     // Fall back to 256-color (safe for xterm-256color and most modern terminals)
     ColorMode::Ansi256
@@ -155,7 +152,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => opts.help = true,
-            "-V" | "--version" => opts.version = true,
+            "-v" | "--version" => opts.version = true,
             "-w" | "--width" => {
                 i += 1;
                 opts.width = Some(parse_num(args, i, "width")?);
@@ -270,10 +267,10 @@ Options:
   -H, --height <N>      Output height in rows (default: auto from aspect ratio)
   -m, --mode <MODE>     block, braille, ascii (default: block)
   -c, --color <MODE>    true, 256, gray (default: true)
-  -d, --dither <TYPE>   fs, ordered, none (default: none)
+  -d, --dither <TYPE>   fs, ordered, none (default: none; 256-color block-mode only)
   -t, --threshold <N>   Braille brightness threshold 0-255 (default: 40)
   -b, --bg <COLOR>      Alpha background: black, white, or R,G,B (default: transparent)
   -h, --help            Show help
-  -V, --version         Show version"
+  -v, --version         Show version"
     );
 }

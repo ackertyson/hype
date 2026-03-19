@@ -4,10 +4,10 @@ pub fn luminance(r: u8, g: u8, b: u8) -> f32 {
 }
 
 /// The 6×6×6 color cube levels.
-const CUBE_LEVELS: [u8; 6] = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+pub const CUBE_LEVELS: [u8; 6] = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
 
 /// Snap a single channel to the nearest cube level index (0–5).
-fn nearest_cube_index(v: u8) -> usize {
+pub fn nearest_cube_index(v: u8) -> usize {
     match v {
         0..=0x2f => 0,
         0x30..=0x72 => 1,

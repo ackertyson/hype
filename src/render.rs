@@ -1,4 +1,6 @@
-use crate::color::{alpha_blend, luminance, nearest_ansi256};
+use crate::color::{CUBE_LEVELS, alpha_blend, luminance, nearest_ansi256, nearest_cube_index};
+use std::borrow::Cow;
+use std::fmt::Write;
 
 /// Pixel with RGBA.
 #[derive(Clone, Copy)]
@@ -61,18 +63,17 @@ pub fn render_block(
                 (true, true) => {
                     let fg = (top.r, top.g, top.b);
                     let bg_c = (bot.r, bot.g, bot.b);
-                    emit_fg(&mut out, fg, &mut last_fg, color_mode);
-                    emit_bg(&mut out, bg_c, &mut last_bg_color, color_mode);
+                    emit_color(&mut out, fg, &mut last_fg, color_mode, 38);
+                    emit_color(&mut out, bg_c, &mut last_bg_color, color_mode, 48);
                     out.push('▀');
                 }
                 (true, false) => {
                     let fg = (top.r, top.g, top.b);
-                    // Reset BG if we had one
                     if last_bg_color.is_some() {
                         out.push_str("\x1b[49m");
                         last_bg_color = None;
                     }
-                    emit_fg(&mut out, fg, &mut last_fg, color_mode);
+                    emit_color(&mut out, fg, &mut last_fg, color_mode, 38);
                     out.push('▀');
                 }
                 (false, true) => {
@@ -81,7 +82,7 @@ pub fn render_block(
                         out.push_str("\x1b[49m");
                         last_bg_color = None;
                     }
-                    emit_fg(&mut out, fg, &mut last_fg, color_mode);
+                    emit_color(&mut out, fg, &mut last_fg, color_mode, 38);
                     out.push('▄');
                 }
                 (false, false) => {
@@ -142,27 +143,25 @@ pub fn render_braille(
                 for dx in 0..2 {
                     let x = px + dx;
                     let y = py + dy;
-                    if x < width && y < height {
-                        let p = pixels[y * width + x];
-                        let lum = luminance(p.r, p.g, p.b);
-                        if lum > threshold as f32 {
-                            let braille_idx = match (dx, dy) {
-                                (0, 0) => 0,
-                                (0, 1) => 1,
-                                (0, 2) => 2,
-                                (0, 3) => 6,
-                                (1, 0) => 3,
-                                (1, 1) => 4,
-                                (1, 2) => 5,
-                                (1, 3) => 7,
-                                _ => unreachable!(),
-                            };
-                            pattern |= dot_bits[braille_idx];
-                            r_sum += p.r as u32;
-                            g_sum += p.g as u32;
-                            b_sum += p.b as u32;
-                            lit_count += 1;
-                        }
+                    let p = pixels[y * width + x];
+                    let lum = luminance(p.r, p.g, p.b);
+                    if lum > threshold as f32 {
+                        let braille_idx = match (dx, dy) {
+                            (0, 0) => 0,
+                            (0, 1) => 1,
+                            (0, 2) => 2,
+                            (0, 3) => 6,
+                            (1, 0) => 3,
+                            (1, 1) => 4,
+                            (1, 2) => 5,
+                            (1, 3) => 7,
+                            _ => unreachable!(),
+                        };
+                        pattern |= dot_bits[braille_idx];
+                        r_sum += p.r as u32;
+                        g_sum += p.g as u32;
+                        b_sum += p.b as u32;
+                        lit_count += 1;
                     }
                 }
             }
@@ -173,7 +172,13 @@ pub fn render_braille(
                 let avg_r = (r_sum / lit_count) as u8;
                 let avg_g = (g_sum / lit_count) as u8;
                 let avg_b = (b_sum / lit_count) as u8;
-                emit_fg(&mut out, (avg_r, avg_g, avg_b), &mut last_fg, color_mode);
+                emit_color(
+                    &mut out,
+                    (avg_r, avg_g, avg_b),
+                    &mut last_fg,
+                    color_mode,
+                    38,
+                );
             }
             out.push(ch);
         }
@@ -208,7 +213,7 @@ pub fn render_ascii(
             let ch = ramp[idx.min(ramp.len() - 1)] as char;
 
             if color_mode != ColorMode::Gray {
-                emit_fg(&mut out, (p.r, p.g, p.b), &mut last_fg, color_mode);
+                emit_color(&mut out, (p.r, p.g, p.b), &mut last_fg, color_mode, 38);
             }
             out.push(ch);
         }
@@ -221,11 +226,13 @@ pub fn render_ascii(
     out
 }
 
-fn emit_fg(
+/// Emit an ANSI color escape. `layer` is 38 for foreground, 48 for background.
+fn emit_color(
     out: &mut String,
     color: (u8, u8, u8),
     last: &mut Option<(u8, u8, u8)>,
     mode: ColorMode,
+    layer: u8,
 ) {
     if *last == Some(color) {
         return;
@@ -233,58 +240,43 @@ fn emit_fg(
     *last = Some(color);
     match mode {
         ColorMode::True => {
-            out.push_str(&format!("\x1b[38;2;{};{};{}m", color.0, color.1, color.2));
+            let _ = write!(out, "\x1b[{layer};2;{};{};{}m", color.0, color.1, color.2);
         }
         ColorMode::Ansi256 => {
             let idx = nearest_ansi256(color.0, color.1, color.2);
-            out.push_str(&format!("\x1b[38;5;{}m", idx));
+            let _ = write!(out, "\x1b[{layer};5;{idx}m");
         }
         ColorMode::Gray => {}
     }
 }
 
-fn emit_bg(
-    out: &mut String,
-    color: (u8, u8, u8),
-    last: &mut Option<(u8, u8, u8)>,
-    mode: ColorMode,
-) {
-    if *last == Some(color) {
-        return;
-    }
-    *last = Some(color);
-    match mode {
-        ColorMode::True => {
-            out.push_str(&format!("\x1b[48;2;{};{};{}m", color.0, color.1, color.2));
-        }
-        ColorMode::Ansi256 => {
-            let idx = nearest_ansi256(color.0, color.1, color.2);
-            out.push_str(&format!("\x1b[48;5;{}m", idx));
-        }
-        ColorMode::Gray => {}
-    }
-}
-
-/// Apply background color to pixels with alpha, or pass through if no bg.
-fn apply_bg(pixels: &[Pixel], bg: Option<(u8, u8, u8)>) -> Vec<Pixel> {
+/// Apply background color to pixels with alpha, or borrow if no bg.
+fn apply_bg<'a>(pixels: &'a [Pixel], bg: Option<(u8, u8, u8)>) -> Cow<'a, [Pixel]> {
     match bg {
-        Some((br, bg_g, bb)) => pixels
-            .iter()
-            .map(|p| {
-                let (r, g, b) = alpha_blend(p.r, p.g, p.b, p.a, br, bg_g, bb);
-                Pixel { r, g, b, a: 255 }
-            })
-            .collect(),
-        None => pixels.to_vec(),
+        Some((br, bg_g, bb)) => Cow::Owned(
+            pixels
+                .iter()
+                .map(|p| {
+                    let (r, g, b) = alpha_blend(p.r, p.g, p.b, p.a, br, bg_g, bb);
+                    Pixel { r, g, b, a: 255 }
+                })
+                .collect(),
+        ),
+        None => Cow::Borrowed(pixels),
     }
 }
 
 /// Apply dithering to quantize colors for 256-color mode.
-fn dither_pixels(pixels: &[Pixel], width: usize, height: usize, dither: Dither) -> Vec<Pixel> {
+fn dither_pixels<'a>(
+    pixels: &'a [Pixel],
+    width: usize,
+    height: usize,
+    dither: Dither,
+) -> Cow<'a, [Pixel]> {
     match dither {
-        Dither::FloydSteinberg => floyd_steinberg(pixels, width, height),
-        Dither::Ordered => ordered_dither(pixels, width, height),
-        Dither::None => pixels.to_vec(),
+        Dither::FloydSteinberg => Cow::Owned(floyd_steinberg(pixels, width, height)),
+        Dither::Ordered => Cow::Owned(ordered_dither(pixels, width, height)),
+        Dither::None => Cow::Borrowed(pixels),
     }
 }
 
@@ -337,18 +329,7 @@ fn floyd_steinberg(pixels: &[Pixel], width: usize, height: usize) -> Vec<Pixel> 
 
 /// Quantize a float channel to the nearest 6-level cube value.
 fn quantize_channel(v: f32) -> u8 {
-    let v = v.clamp(0.0, 255.0) as u8;
-    let levels: [u8; 6] = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
-    let mut best = levels[0];
-    let mut best_dist = (v as i16 - best as i16).unsigned_abs();
-    for &l in &levels[1..] {
-        let d = (v as i16 - l as i16).unsigned_abs();
-        if d < best_dist {
-            best = l;
-            best_dist = d;
-        }
-    }
-    best
+    CUBE_LEVELS[nearest_cube_index(v.clamp(0.0, 255.0) as u8)]
 }
 
 const BAYER_4X4: [[f32; 4]; 4] = [
