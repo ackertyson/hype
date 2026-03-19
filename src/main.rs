@@ -145,7 +145,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         mode: Mode::Block,
         color: default_color,
         dither: Dither::None,
-        threshold: 128,
+        threshold: 40,
         bg: None,
         help: false,
         version: false,
@@ -271,7 +271,7 @@ Options:
   -m, --mode <MODE>     block, braille, ascii (default: block)
   -c, --color <MODE>    true, 256, gray (default: true)
   -d, --dither <TYPE>   fs, ordered, none (default: none)
-  -t, --threshold <N>   Braille brightness threshold 0-255 (default: 128)
+  -t, --threshold <N>   Braille brightness threshold 0-255 (default: 40)
   -b, --bg <COLOR>      Alpha background: black, white, or R,G,B (default: transparent)
   -h, --help            Show help
   -V, --version         Show version"
