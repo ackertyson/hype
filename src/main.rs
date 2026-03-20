@@ -255,6 +255,109 @@ fn parse_bg(s: &str) -> Result<(u8, u8, u8), String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_image_only() {
+        let a = args(&["photo.png"]);
+        let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert_eq!(opts.image.as_deref(), Some("photo.png"));
+        assert!(!opts.help);
+        assert!(!opts.version);
+    }
+
+    #[test]
+    fn parse_args_all_flags() {
+        let a = args(&[
+            "img.jpg", "-w", "120", "-H", "40", "-m", "braille", "-c", "256", "-d", "fs", "-t",
+            "100", "-b", "white",
+        ]);
+        let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert_eq!(opts.width, Some(120));
+        assert_eq!(opts.height, Some(40));
+        assert!(matches!(opts.mode, Mode::Braille));
+        assert_eq!(opts.color, ColorMode::Ansi256);
+        assert_eq!(opts.dither, Dither::FloydSteinberg);
+        assert_eq!(opts.threshold, 100);
+        assert_eq!(opts.bg, Some((255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_args_help_and_version() {
+        let a = args(&["-h"]);
+        assert!(parse_args(&a, ColorMode::True).unwrap().help);
+
+        let a = args(&["--version"]);
+        assert!(parse_args(&a, ColorMode::True).unwrap().version);
+    }
+
+    fn expect_err(a: &[&str], needle: &str) {
+        match parse_args(&args(a), ColorMode::True) {
+            Err(e) => assert!(e.contains(needle), "expected '{needle}' in error: {e}"),
+            Ok(_) => panic!("expected error containing '{needle}'"),
+        }
+    }
+
+    #[test]
+    fn parse_args_unknown_option() {
+        expect_err(&["--bogus"], "unknown option");
+    }
+
+    #[test]
+    fn parse_args_missing_value() {
+        expect_err(&["-w"], "missing value");
+    }
+
+    #[test]
+    fn parse_args_invalid_mode() {
+        expect_err(&["-m", "pixel"], "unknown mode");
+    }
+
+    #[test]
+    fn parse_args_duplicate_positional() {
+        expect_err(&["a.png", "b.png"], "unexpected argument");
+    }
+
+    #[test]
+    fn parse_args_threshold_out_of_range() {
+        expect_err(&["-t", "300"], "threshold");
+    }
+
+    #[test]
+    fn parse_args_default_color_mode_preserved() {
+        let a = args(&["img.png"]);
+        let opts = parse_args(&a, ColorMode::Ansi256).unwrap();
+        assert_eq!(opts.color, ColorMode::Ansi256);
+    }
+
+    #[test]
+    fn parse_bg_named() {
+        assert_eq!(parse_bg("black"), Ok((0, 0, 0)));
+        assert_eq!(parse_bg("white"), Ok((255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_bg_rgb() {
+        assert_eq!(parse_bg("10,20,30"), Ok((10, 20, 30)));
+        assert_eq!(parse_bg("0,0,0"), Ok((0, 0, 0)));
+        assert_eq!(parse_bg("255,255,255"), Ok((255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_bg_invalid() {
+        assert!(parse_bg("red").is_err());
+        assert!(parse_bg("10,20").is_err());
+        assert!(parse_bg("10,20,300").is_err());
+        assert!(parse_bg("").is_err());
+    }
+}
+
 fn print_help() {
     println!(
         "\

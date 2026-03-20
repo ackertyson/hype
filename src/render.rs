@@ -12,7 +12,7 @@ pub struct Pixel {
 }
 
 /// Color output mode.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColorMode {
     True,
     Ansi256,
@@ -20,7 +20,7 @@ pub enum ColorMode {
 }
 
 /// Dither method.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Dither {
     None,
     FloydSteinberg,

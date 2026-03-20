@@ -72,3 +72,77 @@ pub fn alpha_blend(fr: u8, fg: u8, fb: u8, fa: u8, br: u8, bg: u8, bb: u8) -> (u
     let b = (fb as f32 * a + bb as f32 * inv) as u8;
     (r, g, b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_ansi256_pure_red() {
+        // Pure red (255,0,0) → cube index 16 + 5*36 = 196
+        assert_eq!(nearest_ansi256(255, 0, 0), 196);
+    }
+
+    #[test]
+    fn nearest_ansi256_pure_green() {
+        // Pure green (0,255,0) → cube index 16 + 5*6 = 46
+        assert_eq!(nearest_ansi256(0, 255, 0), 46);
+    }
+
+    #[test]
+    fn nearest_ansi256_pure_blue() {
+        // Pure blue (0,0,255) → cube index 16 + 5 = 21
+        assert_eq!(nearest_ansi256(0, 0, 255), 21);
+    }
+
+    #[test]
+    fn nearest_ansi256_white() {
+        // Pure white (255,255,255) → cube 16+5*36+5*6+5=231 or grayscale 255=231
+        let idx = nearest_ansi256(255, 255, 255);
+        // Should pick cube 231 or grayscale — both are valid white
+        assert!(idx == 231 || idx == 255);
+    }
+
+    #[test]
+    fn nearest_ansi256_mid_gray_prefers_grayscale() {
+        // A neutral gray like (128,128,128) should prefer the grayscale ramp
+        // over the color cube, since grayscale has finer steps for grays
+        let idx = nearest_ansi256(128, 128, 128);
+        assert!(idx >= 232, "mid gray should use grayscale ramp, got {idx}");
+    }
+
+    #[test]
+    fn nearest_ansi256_near_cube_prefers_cube() {
+        // A saturated color like (0x5f, 0, 0xaf) should match the cube exactly
+        // Cube: ri=1, gi=0, bi=3 → 16 + 1*36 + 0*6 + 3 = 55
+        assert_eq!(nearest_ansi256(0x5f, 0, 0xaf), 55);
+    }
+
+    #[test]
+    fn alpha_blend_fully_opaque() {
+        assert_eq!(alpha_blend(100, 150, 200, 255, 0, 0, 0), (100, 150, 200));
+    }
+
+    #[test]
+    fn alpha_blend_fully_transparent() {
+        assert_eq!(alpha_blend(100, 150, 200, 0, 10, 20, 30), (10, 20, 30));
+    }
+
+    #[test]
+    fn alpha_blend_half() {
+        let (r, g, b) = alpha_blend(200, 100, 0, 128, 0, 0, 0);
+        // ~50% blend: 200*0.502 + 0*0.498 ≈ 100
+        assert!((r as i16 - 100).unsigned_abs() <= 2, "r={r}");
+        assert!((g as i16 - 50).unsigned_abs() <= 2, "g={g}");
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn alpha_blend_over_white() {
+        let (r, g, b) = alpha_blend(0, 0, 0, 128, 255, 255, 255);
+        // ~50% black over white ≈ 127
+        assert!((r as i16 - 127).unsigned_abs() <= 2, "r={r}");
+        assert!((g as i16 - 127).unsigned_abs() <= 2, "g={g}");
+        assert!((b as i16 - 127).unsigned_abs() <= 2, "b={b}");
+    }
+}

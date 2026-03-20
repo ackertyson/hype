@@ -13,10 +13,9 @@ cargo fmt                # format code (run after changes)
 cargo clippy             # lint (run after changes, fix any warnings)
 cargo build              # debug build
 cargo build --release    # release build
+cargo test                # run tests
 cargo run -- <image> [options]  # run directly
 ```
-
-No tests or linter are configured.
 
 ## Architecture
 
