@@ -9,6 +9,8 @@ Hype is a terminal image viewer written in Rust (edition 2024). It renders image
 ## Build & Run
 
 ```bash
+cargo fmt                # format code (run after changes)
+cargo clippy             # lint (run after changes, fix any warnings)
 cargo build              # debug build
 cargo build --release    # release build
 cargo run -- <image> [options]  # run directly
