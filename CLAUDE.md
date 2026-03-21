@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Hype is a terminal image viewer written in Rust (edition 2024). It renders images as colored text using half-block, braille, or ASCII characters with support for truecolor, 256-color, and grayscale output.
+Hype is a terminal text art generator written in Rust (edition 2024). It renders images as colored text using half-block, braille, or ASCII characters with support for truecolor, 256-color, and grayscale output.
 
 ## Build & Run
 

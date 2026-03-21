@@ -6,6 +6,8 @@ use render::{ColorMode, Dither, Pixel};
 use std::process;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const LOGO_256: &str = include_str!("../logo_256.txt");
+const LOGO_TRUE: &str = include_str!("../logo_truecolor.txt");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,7 +20,7 @@ fn main() {
     };
 
     if opts.help {
-        print_help();
+        print_help(opts.color);
         return;
     }
     if opts.version {
@@ -151,7 +153,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-h" | "--help" => opts.help = true,
+            "-h" | "--help" | "help" => opts.help = true,
             "-v" | "--version" => opts.version = true,
             "-w" | "--width" => {
                 i += 1;
@@ -358,22 +360,104 @@ mod tests {
     }
 }
 
-fn print_help() {
-    println!(
-        "\
-hype {VERSION} — terminal image art generator
+/// Visible width of a string, skipping ANSI escape sequences.
+fn visible_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c.is_ascii_alphabetic() {
+                in_esc = false;
+            }
+        } else if c == '\x1b' {
+            in_esc = true;
+        } else {
+            w += 1;
+        }
+    }
+    w
+}
 
-USAGE: hype <IMAGE> [OPTIONS]
+fn print_help(color: ColorMode) {
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const DIM: &str = "\x1b[2m";
+    const R: &str = "\x1b[0m";
+    const BG: &str = "\x1b[1;32m";
+    const BW: &str = "\x1b[1m";
 
-Options:
-  -w, --width <N>       Output width in columns (default: terminal width)
-  -H, --height <N>      Output height in rows (default: auto from aspect ratio)
-  -m, --mode <MODE>     block, braille, ascii (default: block)
-  -c, --color <MODE>    true, 256, gray (default: true)
-  -d, --dither <TYPE>   fs, ordered, none (default: none; 256-color block-mode only)
-  -t, --threshold <N>   Braille brightness threshold 0-255 (default: 40)
-  -b, --bg <COLOR>      Alpha background: black, white, or R,G,B (default: transparent)
-  -h, --help            Show help
-  -v, --version         Show version"
-    );
+    let lines = vec![
+        format!("hype v{VERSION} \u{2014} terminal text art generator"),
+        String::new(),
+        format!("{BG}Usage:{R} {BW}hype{R} {GREEN}<IMAGE>{R} [OPTIONS]"),
+        String::new(),
+        format!("{BG}Options:{R}"),
+        format!(
+            "  {BW}-w{R}, {BW}--width{R} {GREEN}<N>{R}       Output width in columns {DIM}(default: terminal width){R}"
+        ),
+        format!(
+            "  {BW}-H{R}, {BW}--height{R} {GREEN}<N>{R}      Output height in rows {DIM}(default: auto from aspect ratio){R}"
+        ),
+        format!(
+            "  {BW}-m{R}, {BW}--mode{R} {GREEN}<MODE>{R}     block, braille, ascii {DIM}(default: block){R}"
+        ),
+        format!(
+            "  {BW}-c{R}, {BW}--color{R} {GREEN}<MODE>{R}    true, 256, gray {DIM}(default: true){R}"
+        ),
+        format!(
+            "  {BW}-d{R}, {BW}--dither{R} {GREEN}<TYPE>{R}   fs, ordered, none {DIM}(default: none; 256-color block-mode only){R}"
+        ),
+        format!(
+            "  {BW}-t{R}, {BW}--threshold{R} {GREEN}<N>{R}   Braille brightness threshold 0\u{2013}255 {DIM}(default: 40){R}"
+        ),
+        format!(
+            "  {BW}-b{R}, {BW}--bg{R} {GREEN}<COLOR>{R}      Alpha background: {YELLOW}black{R}, {YELLOW}white{R}, or {YELLOW}R,G,B{R} {DIM}(default: transparent){R}"
+        ),
+        format!("  {BW}-h{R}, {BW}--help{R}, {BW}help{R}      Show help"),
+        format!("  {BW}-v{R}, {BW}--version{R}         Show version"),
+    ];
+
+    let logo = if color == ColorMode::True {
+        LOGO_TRUE
+    } else {
+        LOGO_256
+    };
+    let logo_lines: Vec<&str> = logo.lines().collect();
+    let logo_width = logo_lines
+        .iter()
+        .map(|l| visible_width(l))
+        .max()
+        .unwrap_or(0);
+
+    let gap = 4;
+    let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+    let needed = help_width + gap + logo_width;
+    let tw = terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80);
+
+    if tw >= needed && !logo_lines.is_empty() {
+        let total = lines.len().max(logo_lines.len());
+        let help_offset = 0;
+        let logo_offset = total.saturating_sub(logo_lines.len()) / 2;
+
+        for i in 0..total {
+            let help_part = if i >= help_offset && i - help_offset < lines.len() {
+                &lines[i - help_offset]
+            } else {
+                ""
+            };
+            let logo_part = if i >= logo_offset && i - logo_offset < logo_lines.len() {
+                logo_lines[i - logo_offset]
+            } else {
+                ""
+            };
+            let pad = help_width + gap - visible_width(help_part);
+            println!("{}{:pad$}{}\x1b[0m", help_part, "", logo_part, pad = pad);
+        }
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
+    }
 }
