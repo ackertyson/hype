@@ -14,7 +14,7 @@ cargo install --path .
 
 ## Usage
 
-Run `hype help` for full usage details and options.
+Run `hype help`
 
 ## Features
 
