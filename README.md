@@ -2,6 +2,8 @@
 
 A terminal text art generator that renders images as colored text.
 
+![hype banana logo](logo.jpg)
+
 ## Install
 
 ### From source
