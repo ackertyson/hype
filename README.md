@@ -4,7 +4,7 @@ A terminal text art generator that renders images as colored text.
 
 ![hype banana logo](logo.jpg)
 
-![hype demo mp4](https://github.com/user-attachments/assets/20e1d190-d08c-40be-9753-c83d0ff128f8)
+<video src="https://github.com/user-attachments/assets/20e1d190-d08c-40be-9753-c83d0ff128f8" autoplay loop muted playsinline></video>
 
 ## Install
 
