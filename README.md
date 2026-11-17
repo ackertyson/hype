@@ -14,6 +14,10 @@ A terminal text art generator that renders images as colored text.
 brew install ackertyson/hype/hype
 ```
 
+This installs a prebuilt binary (macOS and Linux, arm64 and x86_64) with no dependencies.
+
+Prebuilt binaries are also attached to each [GitHub release](https://github.com/ackertyson/hype/releases).
+
 ### From source
 
 Install [Rust](https://rust-lang.org/tools/install), then:

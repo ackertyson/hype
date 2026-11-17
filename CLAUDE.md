@@ -18,6 +18,8 @@ cargo deny check         # dependency policy: advisories, licenses, sources, ban
 cargo run -- <image> [options]  # run directly
 ```
 
+Releasing: `build/tag.sh X.Y.Z` (on an up-to-date master) bumps `Cargo.toml`, commits, tags and pushes. The tag runs `.github/workflows/release.yml`, which builds static binaries (macOS arm64/x86_64, Linux musl arm64/x86_64) and attaches them with `checksums.txt` to a GitHub release. Then run `release.sh X.Y.Z` in the `homebrew-hype` tap to point the formula at them.
+
 ## Architecture
 
 Source files in `src/`:
