@@ -573,6 +573,43 @@ fn apply_bg(pixels: &mut [Pixel], bg: Option<(u8, u8, u8)>) {
     }
 }
 
+/// Composite `layer` (`layer_w` wide) over `canvas` (`canvas_w` wide) with
+/// its top-left corner at (`x0`, `y0`), using straight-alpha "over". The
+/// layer must lie within the canvas.
+pub fn overlay(
+    canvas: &mut [Pixel],
+    canvas_w: usize,
+    layer: &[Pixel],
+    layer_w: usize,
+    x0: usize,
+    y0: usize,
+) {
+    for (y, row) in layer.chunks_exact(layer_w).enumerate() {
+        let dst = &mut canvas[(y0 + y) * canvas_w + x0..][..layer_w];
+        for (d, s) in dst.iter_mut().zip(row) {
+            *d = over(*s, *d);
+        }
+    }
+}
+
+/// `src` over `dst`, in exact integers scaled by 255².
+fn over(src: Pixel, dst: Pixel) -> Pixel {
+    match src.a {
+        255 => return src,
+        0 => return dst,
+        _ => {}
+    }
+    let (sa, da) = (src.a as u32 * 255, dst.a as u32 * (255 - src.a as u32));
+    let a = sa + da;
+    let c = |s: u8, d: u8| ((s as u32 * sa + d as u32 * da + a / 2) / a) as u8;
+    Pixel {
+        r: c(src.r, dst.r),
+        g: c(src.g, dst.g),
+        b: c(src.b, dst.b),
+        a: ((a + 127) / 255) as u8,
+    }
+}
+
 fn floyd_steinberg(pixels: &mut [Pixel], width: usize, height: usize) {
     let mut buf: Vec<[f32; 3]> = pixels
         .iter()
@@ -753,6 +790,29 @@ mod tests {
         // A translucent edge is antialiased against the assumed-dark terminal.
         let s = block(&cells(&["####...."], px(255, 0, 0, 191), CLEAR), 1);
         assert_eq!(s, "\x1b[38;2;191;0;0m▀\x1b[0m");
+    }
+
+    #[test]
+    fn over_blends_straight_alpha() {
+        let half_red = px(255, 0, 0, 128);
+        // Opaque destination: a plain mix, staying opaque.
+        let p = over(half_red, BLUE);
+        assert_eq!((p.r, p.g, p.b, p.a), (128, 0, 127, 255));
+        // Transparent destination: the source unchanged.
+        let p = over(half_red, CLEAR);
+        assert_eq!((p.r, p.g, p.b, p.a), (255, 0, 0, 128));
+        // Two halves make three quarters, two parts top to one part below.
+        let p = over(half_red, px(0, 0, 255, 128));
+        assert_eq!((p.r, p.g, p.b, p.a), (170, 0, 85, 192));
+    }
+
+    #[test]
+    fn overlay_places_layer() {
+        // 1x1 red layer at (1, 0) on a 2x2 blue canvas.
+        let mut canvas = vec![BLUE; 4];
+        overlay(&mut canvas, 2, &[RED], 1, 1, 0);
+        let r: Vec<u8> = canvas.iter().map(|p| p.r).collect();
+        assert_eq!(r, [0, 255, 0, 0]);
     }
 
     fn braille(pixels: &[Pixel], cols: usize) -> String {

@@ -18,8 +18,7 @@ use std::io::Write;
 use std::process;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const LOGO_256: &str = include_str!("../logo_256.txt");
-const LOGO_TRUE: &str = include_str!("../logo_truecolor.txt");
+const LOGO: &[u8] = include_bytes!("../banana.png");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,22 +39,23 @@ fn main() {
         return;
     }
 
-    let path = opts.image.as_deref().unwrap_or_else(|| {
+    let Some((base, layers)) = opts.images.split_first() else {
         eprintln!("hype: no image specified (use -h for help)");
         process::exit(1);
-    });
-
-    let term_width = opts.width.unwrap_or_else(|| term::width().unwrap_or(80));
-    let size = |img_w: usize, img_h: usize| target_size(term_width, opts.height, img_w, img_h);
-
-    let mut img = match decode::load(path, size) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("hype: cannot open '{path}': {e}");
-            process::exit(1);
-        }
     };
+
+    let term_width = term::width().unwrap_or(80);
+    let mut img = open(base, |img_w, img_h| {
+        target_size(opts.width, opts.height, term_width, img_w, img_h)
+    });
     let (w, h) = (img.width, img.height);
+    // Each further layer is fit inside the canvas, centered, and composited
+    // over it in order.
+    for path in layers {
+        let layer = open(path, |img_w, img_h| fit_size(w, h, img_w, img_h));
+        let (x0, y0) = ((w - layer.width) / 2, (h - layer.height) / 2);
+        render::overlay(&mut img.pixels, w, &layer.pixels, layer.width, x0, y0);
+    }
 
     let mut out = Vec::with_capacity(w * h * 12);
     let px = &mut img.pixels;
@@ -71,15 +71,46 @@ fn main() {
     emit(&out);
 }
 
+fn open(path: &str, size: impl Fn(usize, usize) -> (usize, usize)) -> decode::Image {
+    decode::load(path, size).unwrap_or_else(|e| {
+        eprintln!("hype: cannot open '{path}': {e}");
+        process::exit(1);
+    })
+}
+
 /// Resampled pixel dimensions: every mode samples each character cell as
-/// 2×4 subpixels. Cells are about twice as tall as wide, so an image needs
-/// half as many rows as its aspect ratio implies.
-fn target_size(cols: usize, height: Option<usize>, img_w: usize, img_h: usize) -> (usize, usize) {
-    let cols = cols.max(1);
-    let rows = height
-        .unwrap_or_else(|| ((cols as f64 * img_h as f64 / img_w as f64) as usize).div_ceil(2))
-        .max(1);
-    (cols * 2, rows * 4)
+/// 2×4 subpixels. A side not given follows the image's aspect ratio (cells
+/// are about twice as tall as wide); with neither, the width is
+/// `default_cols`. Both given: stretch.
+fn target_size(
+    width: Option<usize>,
+    height: Option<usize>,
+    default_cols: usize,
+    img_w: usize,
+    img_h: usize,
+) -> (usize, usize) {
+    let (cols, rows) = match (width, height) {
+        (Some(cols), Some(rows)) => (cols, rows),
+        (None, Some(rows)) => ((rows * 2 * img_w + img_h / 2) / img_h, rows),
+        (cols, None) => {
+            let cols = cols.unwrap_or(default_cols).max(1);
+            let rows = ((cols as f64 * img_h as f64 / img_w as f64) as usize).div_ceil(2);
+            (cols, rows)
+        }
+    };
+    (cols.max(1) * 2, rows.max(1) * 4)
+}
+
+/// Largest size with the image's aspect ratio that fits a `canvas_w`×`canvas_h`
+/// canvas. Subpixels are about square, so no cell-shape correction is needed.
+fn fit_size(canvas_w: usize, canvas_h: usize, img_w: usize, img_h: usize) -> (usize, usize) {
+    if img_w * canvas_h <= img_h * canvas_w {
+        let w = (img_w * canvas_h + img_h / 2) / img_h;
+        (w.clamp(1, canvas_w), canvas_h)
+    } else {
+        let h = (img_h * canvas_w + img_w / 2) / img_w;
+        (canvas_w, h.clamp(1, canvas_h))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +121,8 @@ enum Mode {
 }
 
 struct Opts {
-    image: Option<String>,
+    images: Vec<String>,
+    layer: bool,
     width: Option<usize>,
     height: Option<usize>,
     mode: Mode,
@@ -116,7 +148,8 @@ fn detect_color_support() -> ColorMode {
 
 fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String> {
     let mut opts = Opts {
-        image: None,
+        images: Vec::new(),
+        layer: false,
         width: None,
         height: None,
         mode: Mode::Block,
@@ -133,6 +166,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         match args[i].as_str() {
             "-h" | "--help" | "help" => opts.help = true,
             "-v" | "--version" => opts.version = true,
+            "-l" | "--layer" => opts.layer = true,
             "-w" | "--width" => {
                 i += 1;
                 opts.width = Some(parse_num(args, i, "width")?);
@@ -188,14 +222,19 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 if other.starts_with('-') {
                     return Err(format!("unknown option '{other}'"));
                 }
-                if opts.image.is_none() {
-                    opts.image = Some(other.to_string());
-                } else {
-                    return Err(format!("unexpected argument '{other}'"));
-                }
+                opts.images.push(other.to_string());
             }
         }
         i += 1;
+    }
+    // Several images are only layered when asked for, so a stray argument or
+    // an unexpected glob match stays an error.
+    if let [_, extra, ..] = &opts.images[..]
+        && !opts.layer
+    {
+        return Err(format!(
+            "unexpected argument '{extra}' (use --layer to overlay images)"
+        ));
     }
     Ok(opts)
 }
@@ -259,15 +298,17 @@ const HELP_TOP: &str = "\
 $bhype$0 {VERSION} \u{2014} images as high-fidelity terminal text art, fast
 
 $hUsage:$0 $bhype$0 $a<IMAGE>$0 [OPTIONS]
+       $bhype$0 $b--layer$0 $a<IMAGE>$0... [OPTIONS]
 
 $hOptions:$0
-  $b-w$0, $b--width$0 $a<N>$0       Width in columns $d(default: terminal width, 80 if none)$0
+  $b-w$0, $b--width$0 $a<N>$0       Width in columns $d(default: fit -H, else terminal width)$0
   $b-H$0, $b--height$0 $a<N>$0      Height in rows $d(default: keep the image's aspect ratio)$0
   $b-m$0, $b--mode$0 $a<MODE>$0     $yblock$0, $ybraille$0, $yascii$0 $d(default: block)$0
   $b-c$0, $b--color$0 $a<MODE>$0    $ytrue$0, $y256$0, $ygray$0 $d(default: auto-detected, here {COLOR})$0
   $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
   $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
+  $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
 
@@ -282,8 +323,12 @@ $hOutput contract$0 $d(for scripts and agents)$0
   - stdout carries only the image: one line per row, each exactly W columns
     wide (UTF-8 with ANSI SGR color codes), then a final newline. No color
     state carries over between lines, so lines can be used individually.
-  - Rows come from -H, else from the width and the image's aspect ratio
-    (cells are about twice as tall as wide). Both -w and -H given: stretch.
+  - Size: -w or -H alone sets that side and the other follows the image's
+    aspect ratio (cells are about twice as tall as wide); neither: terminal
+    width (80 if unknown). Both -w and -H given: stretch.
+  - With --layer, the first image sets the size; each later one is scaled
+    to fit inside it, keeping its aspect ratio, centered, and drawn over
+    the layers before it.
   - With -w and -c given, output is deterministic for the same image.
   - $b-c gray$0 in braille or ascii mode emits no escape codes at all.
   - Transparent areas show the terminal background unless -b is given.
@@ -300,6 +345,7 @@ $hExamples:$0
   $bhype$0 logo.png -w 60 -c 256        $d# for a 256-color terminal$0
   $bhype$0 logo.png -m ascii -c gray    $d# plain ASCII, no escape codes$0
   $bhype$0 logo.png -w 80 > logo.ans    $d# save now, show later with cat$0
+  $bhype$0 -l frame.png icon.png        $d# icon centered over frame$0
 ";
 
 fn print_help(color: ColorMode) {
@@ -337,39 +383,50 @@ fn print_help(color: ColorMode) {
         }
         s
     };
-    let (top, rest) = (style(HELP_TOP), style(HELP_REST));
+    let help = style(HELP_TOP) + &style(HELP_REST);
 
-    let logo: Vec<&str> = if color == ColorMode::True {
-        LOGO_TRUE
-    } else {
-        LOGO_256
-    }
-    .lines()
-    .collect();
-    let logo_width = logo.iter().map(|l| visible_width(l)).max().unwrap_or(0);
-    let lines: Vec<&str> = top.lines().collect();
+    let lines: Vec<&str> = help.lines().collect();
     let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
     let gap = 4;
+    let room = term::width().unwrap_or(80).saturating_sub(help_width + gap);
 
     let mut out = String::new();
-    if fancy && term::width().unwrap_or(80) >= help_width + gap + logo_width {
-        let total = lines.len().max(logo.len());
-        let logo_offset = total.saturating_sub(logo.len()) / 2;
-        for i in 0..total {
-            let help = lines.get(i).copied().unwrap_or("");
-            let art = i
-                .checked_sub(logo_offset)
-                .and_then(|j| logo.get(j))
-                .copied()
-                .unwrap_or("");
-            let pad = help_width + gap - visible_width(help);
-            out.push_str(&format!("{help}{:pad$}{art}\x1b[0m\n", ""));
+    match fancy.then(|| logo(room, lines.len(), color)).flatten() {
+        Some(logo) => {
+            // The logo is never taller than the help; center it beside it.
+            let art: Vec<&str> = logo.lines().collect();
+            let offset = (lines.len() - art.len()) / 2;
+            for (i, line) in lines.iter().enumerate() {
+                let pad = help_width + gap - visible_width(line);
+                let art = i.checked_sub(offset).and_then(|j| art.get(j));
+                out.push_str(&format!("{line}{:pad$}{}\n", "", art.unwrap_or(&"")));
+            }
         }
-    } else {
-        out.push_str(&top);
+        None => out.push_str(&help),
     }
-    out.push_str(&rest);
     emit(out.as_bytes());
+}
+
+/// The logo, rendered by hype itself as large as fits beside the help text:
+/// `cols` wide, unless that would be more than `rows` tall. None if there is
+/// too little room or this build lacks PNG.
+fn logo(cols: usize, rows: usize, color: ColorMode) -> Option<String> {
+    if !cfg!(feature = "png") || cols < 16 {
+        return None;
+    }
+    let mut img = decode::from_bytes(LOGO, |w, h| {
+        let size = target_size(Some(cols), None, 0, w, h);
+        if size.1 / 4 <= rows {
+            size
+        } else {
+            target_size(None, Some(rows), 0, w, h)
+        }
+    })
+    .ok()?;
+    let (w, h) = (img.width, img.height);
+    let mut out = Vec::new();
+    render::render_block(&mut img.pixels, w, h, color, Dither::None, None, &mut out);
+    String::from_utf8(out).ok()
 }
 
 /// Write to stdout. A consumer closing the pipe early is not an error worth
@@ -395,7 +452,7 @@ mod tests {
     fn parse_args_image_only() {
         let a = args(&["photo.png"]);
         let opts = parse_args(&a, ColorMode::True).unwrap();
-        assert_eq!(opts.image.as_deref(), Some("photo.png"));
+        assert_eq!(opts.images, ["photo.png"]);
         assert!(!opts.help);
         assert!(!opts.version);
     }
@@ -450,6 +507,41 @@ mod tests {
     #[test]
     fn parse_args_duplicate_positional() {
         expect_err(&["a.png", "b.png"], "unexpected argument");
+    }
+
+    #[test]
+    fn parse_args_layer() {
+        // The flag may come before or after the images; order is kept.
+        for a in [
+            &["-l", "a.png", "b.png", "c.png"][..],
+            &["a.png", "b.png", "c.png", "--layer"],
+        ] {
+            let opts = parse_args(&args(a), ColorMode::True).unwrap();
+            assert_eq!(opts.images, ["a.png", "b.png", "c.png"]);
+        }
+    }
+
+    #[test]
+    fn target_size_sides() {
+        // 2:1 image: 40 columns need 10 rows (cells are twice as tall).
+        assert_eq!(target_size(None, None, 40, 200, 100), (80, 40));
+        assert_eq!(target_size(Some(40), None, 80, 200, 100), (80, 40));
+        // Height alone keeps the aspect ratio rather than taking the default width.
+        assert_eq!(target_size(None, Some(10), 80, 200, 100), (80, 40));
+        // Both: stretch.
+        assert_eq!(target_size(Some(7), Some(3), 80, 200, 100), (14, 12));
+    }
+
+    #[test]
+    fn fit_size_keeps_aspect() {
+        // Wide image in a square canvas: full width, centered vertically.
+        assert_eq!(fit_size(100, 100, 400, 200), (100, 50));
+        // Tall image: full height.
+        assert_eq!(fit_size(100, 100, 100, 400), (25, 100));
+        // Same aspect ratio: fills the canvas.
+        assert_eq!(fit_size(80, 40, 1000, 500), (80, 40));
+        // Never collapses to zero.
+        assert_eq!(fit_size(10, 10, 10000, 1), (10, 1));
     }
 
     #[test]

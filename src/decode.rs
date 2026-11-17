@@ -12,17 +12,25 @@ pub struct Image {
 /// called with the source dimensions once the header has been read.
 pub fn load(path: &str, size: impl Fn(usize, usize) -> (usize, usize)) -> Result<Image, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    from_bytes(&data, size)
+}
+
+/// Like `load`, for an image already in memory.
+pub fn from_bytes(
+    data: &[u8],
+    size: impl Fn(usize, usize) -> (usize, usize),
+) -> Result<Image, String> {
     let mut sink = Sink {
         size: &size,
         r: None,
     };
 
     match &data[..data.len().min(12)] {
-        [0x89, b'P', b'N', b'G', ..] => png(&data, &mut sink)?,
-        [0xff, 0xd8, 0xff, ..] => jpeg(&data, &mut sink)?,
-        [b'G', b'I', b'F', b'8', ..] => gif(&data, &mut sink)?,
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P'] => webp(&data, &mut sink)?,
-        [b'B', b'M', ..] => bmp(&data, &mut sink)?,
+        [0x89, b'P', b'N', b'G', ..] => png(data, &mut sink)?,
+        [0xff, 0xd8, 0xff, ..] => jpeg(data, &mut sink)?,
+        [b'G', b'I', b'F', b'8', ..] => gif(data, &mut sink)?,
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P'] => webp(data, &mut sink)?,
+        [b'B', b'M', ..] => bmp(data, &mut sink)?,
         _ => return Err("unsupported image format".into()),
     }
 
