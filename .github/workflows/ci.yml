@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      # Each format feature alone catches code that only compiles (or only
+      # warns) in some feature combinations.
+      - name: Clippy
+        run: |
+          set -e
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          for f in png jpeg gif webp bmp; do
+            echo "clippy: $f only"
+            cargo clippy --locked --all-targets --no-default-features --features "$f" -- -D warnings
+          done
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      # Installed size is a feature: fail if the default release binary
+      # grows past budget (601 KB at the time this was set).
+      - name: Binary size budget
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --release
+          size=$(stat -f %z target/release/hype)
+          echo "release binary: $size bytes (budget 700000)"
+          test "$size" -le 700000
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

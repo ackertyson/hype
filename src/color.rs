@@ -1,6 +1,6 @@
-/// Perceptual luminance (BT.601).
-pub fn luminance(r: u8, g: u8, b: u8) -> f32 {
-    0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+/// Perceptual luminance (BT.601), scaled by 1000 to stay in exact integers.
+pub fn lum1000(r: u8, g: u8, b: u8) -> u32 {
+    299 * r as u32 + 587 * g as u32 + 114 * b as u32
 }
 
 /// The 6×6×6 color cube levels.
@@ -47,8 +47,27 @@ pub fn nearest_ansi256(r: u8, g: u8, b: u8) -> u8 {
     }
 }
 
+/// The RGB value of an ANSI 256-color index (cube or grayscale ramp).
+pub fn ansi256_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        16..=231 => {
+            let i = (i - 16) as usize;
+            (
+                CUBE_LEVELS[i / 36],
+                CUBE_LEVELS[i / 6 % 6],
+                CUBE_LEVELS[i % 6],
+            )
+        }
+        232.. => {
+            let v = 8 + 10 * (i - 232);
+            (v, v, v)
+        }
+        _ => (0, 0, 0),
+    }
+}
+
 /// Weighted Euclidean distance (perceptual weighting).
-fn color_dist(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
+pub fn color_dist(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
     let dr = r1 as i32 - r2 as i32;
     let dg = g1 as i32 - g2 as i32;
     let db = b1 as i32 - b2 as i32;
@@ -116,6 +135,18 @@ mod tests {
         // A saturated color like (0x5f, 0, 0xaf) should match the cube exactly
         // Cube: ri=1, gi=0, bi=3 → 16 + 1*36 + 0*6 + 3 = 55
         assert_eq!(nearest_ansi256(0x5f, 0, 0xaf), 55);
+    }
+
+    #[test]
+    fn ansi256_rgb_round_trips() {
+        for i in 16..=255u8 {
+            let (r, g, b) = ansi256_rgb(i);
+            assert_eq!(
+                ansi256_rgb(nearest_ansi256(r, g, b)),
+                (r, g, b),
+                "index {i}"
+            );
+        }
     }
 
     #[test]

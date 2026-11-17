@@ -8,30 +8,42 @@ A terminal text art generator that renders images as colored text.
 
 ## Install
 
+### Homebrew
+
+```bash
+brew install ackertyson/hype/hype
+```
+
 ### From source
 
 Install [Rust](https://rust-lang.org/tools/install), then:
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
+```
+
+PNG and JPEG are built in. GIF, WebP and BMP are opt-in to keep the binary small:
+
+```bash
+cargo install --locked --path . --features gif,webp,bmp
 ```
 
 ## Usage
 
-Run `hype help`
+Run `hype help`. The help includes an exact output contract for scripts and agents; when its output is captured rather than shown on a terminal, it is plain text.
 
 ## Features
 
 ### Rendering modes
 
-- **Block** — Uses Unicode half-block characters (`▀`/`▄`) to pack two vertical pixels per character cell with independent foreground and background colors. This is the default mode and produces the highest fidelity output.
-- **Braille** — Maps 2x4 pixel blocks to Unicode braille characters (U+2800–U+28FF), giving a dot-matrix look. Each cell is colored by the average color of its lit dots. A configurable brightness threshold controls which dots are lit.
-- **ASCII** — Renders using a range of ASCII characters selected by luminance, for compatibility with any terminal or font.
+- **Block** — The default and highest-fidelity mode. Each character cell is sampled as 2×4 subpixels and drawn with whichever half-block or quadrant glyph (`▀▄▌▐▘▝▖▗▚▞`…) and pair of colors best fits it, giving crisp edges and legible text in logos.
+- **Braille** — Maps each cell to a Unicode braille pattern (U+2800–U+28FF) for a dot-matrix look, in one color per cell. A dot is lit when it is brighter than the threshold and better represented by the cell's color than by the dark background, so dark details stay sharp inside bright areas.
+- **ASCII** — Printable ASCII only, for any terminal or font. Flat areas use a density ramp; along edges, characters are chosen by shape (measured from real monospace fonts) so outlines and lettering stay readable.
 
 ### Color modes
 
 - **Truecolor (24-bit)** — Full RGB color via ANSI escape sequences. Auto-detected from the `COLORTERM` environment variable.
-- **256-color** — Maps colors to the ANSI 256-color palette (6x6x6 color cube + grayscale ramp) using perceptually-weighted nearest-match. Used as the fallback when truecolor is not detected.
+- **256-color** — Maps colors to the ANSI 256-color palette (6x6x6 color cube + grayscale ramp) using perceptually-weighted nearest-match. Block mode fits cell shapes against the palette colors actually displayed. Used as the fallback when truecolor is not detected.
 - **Grayscale** — Renders using only grayscale values.
 
 ### Dithering (256-color block mode)
@@ -43,7 +55,7 @@ Run `hype help`
 
 - **Alpha compositing** — Transparent regions can be composited against a configurable background color (black, white, or any RGB value). Without a background, transparency is preserved as the terminal's own background.
 - **Auto-sizing** — Output dimensions default to the terminal width with aspect ratio preserved. Width and height can also be set explicitly.
-- **Input image format support** — PNG, JPEG, GIF, BMP, and WebP.
+- **Input image format support** — PNG and JPEG by default; GIF, WebP, and BMP via cargo features.
 
 ## Acknowledgements
 

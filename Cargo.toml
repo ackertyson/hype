@@ -2,7 +2,27 @@
 name = "hype"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Render images as high-fidelity terminal text art"
+repository = "https://github.com/ackertyson/hype"
+
+[features]
+default = ["png", "jpeg"]
+png = ["dep:png"]
+jpeg = ["dep:zune-jpeg", "dep:zune-core"]
+gif = ["dep:gif"]
+webp = ["dep:image-webp"]
+bmp = []
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
-terminal_size = "0.4"
+png = { version = "0.18", optional = true }
+zune-jpeg = { version = "0.5", optional = true }
+zune-core = { version = "0.5", optional = true }
+gif = { version = "0.14", optional = true, default-features = false, features = ["std"] }
+image-webp = { version = "0.2", optional = true }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

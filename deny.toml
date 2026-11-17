@@ -1,0 +1,28 @@
+# Dependency policy, checked in CI with `cargo deny check`.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check optional format features too, not just the default build.
+all-features = true
+
+[advisories]
+# Fail on any RustSec advisory, including unmaintained and yanked crates.
+yanked = "deny"
+
+[licenses]
+# Every current dependency is available under one of these.
+allow = ["MIT", "Apache-2.0"]
+
+[bans]
+# Keep the tree lean: one version of each crate.
+multiple-versions = "deny"
+wildcards = "deny"
+deny = [
+    # Replaced by direct decoders; it pulls in far more than hype needs.
+    { name = "image" },
+]
+
+[sources]
+# crates.io only: no git dependencies or other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

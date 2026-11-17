@@ -1,8 +1,20 @@
-mod color;
-mod render;
+#[cfg(not(any(
+    feature = "png",
+    feature = "jpeg",
+    feature = "gif",
+    feature = "webp",
+    feature = "bmp"
+)))]
+compile_error!("enable at least one image format feature (png, jpeg, gif, webp, bmp)");
 
-use image::GenericImageView;
-use render::{ColorMode, Dither, Pixel};
+mod color;
+mod decode;
+mod render;
+mod resize;
+mod term;
+
+use render::{ColorMode, Dither};
+use std::io::Write;
 use std::process;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,7 +36,7 @@ fn main() {
         return;
     }
     if opts.version {
-        println!("hype {VERSION}");
+        emit(format!("hype {VERSION}\n").as_bytes());
         return;
     }
 
@@ -33,75 +45,41 @@ fn main() {
         process::exit(1);
     });
 
-    let img = match image::open(path) {
+    let term_width = opts.width.unwrap_or_else(|| term::width().unwrap_or(80));
+    let size = |img_w: usize, img_h: usize| target_size(term_width, opts.height, img_w, img_h);
+
+    let mut img = match decode::load(path, size) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("hype: cannot open '{path}': {e}");
             process::exit(1);
         }
     };
+    let (w, h) = (img.width, img.height);
 
-    let term_width = opts.width.unwrap_or_else(|| {
-        terminal_size::terminal_size()
-            .map(|(w, _)| w.0 as usize)
-            .unwrap_or(80)
-    });
-
-    let (img_w, img_h) = img.dimensions();
-    let aspect = img_h as f64 / img_w as f64;
-
-    let (resize_w, resize_h) = match opts.mode {
-        Mode::Block => {
-            let cols = term_width;
-            let rows = opts
-                .height
-                .map(|h| h * 2)
-                .unwrap_or_else(|| (cols as f64 * aspect) as usize);
-            // Ensure even height
-            let rows = rows + (rows % 2);
-            (cols as u32, rows as u32)
-        }
+    let mut out = Vec::with_capacity(w * h * 12);
+    let px = &mut img.pixels;
+    match opts.mode {
+        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, opts.bg, &mut out),
         Mode::Braille => {
-            let cols = term_width;
-            let dot_w = cols * 2;
-            let dot_h = opts
-                .height
-                .map(|h| h * 4)
-                .unwrap_or_else(|| (dot_w as f64 * aspect) as usize);
-            // Round to multiples of 4 and 2
-            let dot_h = dot_h.div_ceil(4) * 4;
-            let dot_w = dot_w.div_ceil(2) * 2;
-            (dot_w as u32, dot_h as u32)
+            render::render_braille(px, w, h, opts.color, opts.threshold, opts.bg, &mut out)
         }
-        Mode::Ascii => {
-            let cols = term_width;
-            // Terminal chars are ~2:1 tall, so halve height
-            let rows = opts.height.unwrap_or((cols as f64 * aspect * 0.5) as usize);
-            (cols as u32, rows as u32)
-        }
-    };
+        Mode::Ascii => render::render_ascii(px, w, h, opts.color, opts.bg, &mut out),
+    }
+    out.push(b'\n');
 
-    let resized = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
-    let rgba = resized.to_rgba8();
-    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    emit(&out);
+}
 
-    let pixels: Vec<Pixel> = rgba
-        .pixels()
-        .map(|p| Pixel {
-            r: p[0],
-            g: p[1],
-            b: p[2],
-            a: p[3],
-        })
-        .collect();
-
-    let output = match opts.mode {
-        Mode::Block => render::render_block(&pixels, w, h, opts.color, opts.dither, opts.bg),
-        Mode::Braille => render::render_braille(&pixels, w, h, opts.color, opts.threshold, opts.bg),
-        Mode::Ascii => render::render_ascii(&pixels, w, h, opts.color, opts.bg),
-    };
-
-    println!("{output}");
+/// Resampled pixel dimensions: every mode samples each character cell as
+/// 2×4 subpixels. Cells are about twice as tall as wide, so an image needs
+/// half as many rows as its aspect ratio implies.
+fn target_size(cols: usize, height: Option<usize>, img_w: usize, img_h: usize) -> (usize, usize) {
+    let cols = cols.max(1);
+    let rows = height
+        .unwrap_or_else(|| ((cols as f64 * img_h as f64 / img_w as f64) as usize).div_ceil(2))
+        .max(1);
+    (cols * 2, rows * 4)
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +235,154 @@ fn parse_bg(s: &str) -> Result<(u8, u8, u8), String> {
     }
 }
 
+/// Visible width of a string, skipping ANSI escape sequences.
+fn visible_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c.is_ascii_alphabetic() {
+                in_esc = false;
+            }
+        } else if c == '\x1b' {
+            in_esc = true;
+        } else {
+            w += 1;
+        }
+    }
+    w
+}
+
+/// Help text, shown beside the logo on a wide enough terminal. Style tags:
+/// `$h` heading, `$b` bold, `$a` argument, `$y` value, `$d` dim, `$0` reset.
+const HELP_TOP: &str = "\
+$bhype$0 {VERSION} \u{2014} images as high-fidelity terminal text art, fast
+
+$hUsage:$0 $bhype$0 $a<IMAGE>$0 [OPTIONS]
+
+$hOptions:$0
+  $b-w$0, $b--width$0 $a<N>$0       Width in columns $d(default: terminal width, 80 if none)$0
+  $b-H$0, $b--height$0 $a<N>$0      Height in rows $d(default: keep the image's aspect ratio)$0
+  $b-m$0, $b--mode$0 $a<MODE>$0     $yblock$0, $ybraille$0, $yascii$0 $d(default: block)$0
+  $b-c$0, $b--color$0 $a<MODE>$0    $ytrue$0, $y256$0, $ygray$0 $d(default: auto-detected, here {COLOR})$0
+  $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
+  $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
+  $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
+  $b-h$0, $b--help$0, $bhelp$0      Show this help
+  $b-v$0, $b--version$0         Show version
+
+$hModes:$0
+  $yblock$0     Half blocks and quadrants, two colors per cell. Highest fidelity.
+  $ybraille$0   2x4 dots per cell in one color; unlit dots show the background.
+  $yascii$0     Printable ASCII only: density ramp, shape-matched at edges.
+";
+
+const HELP_REST: &str = "
+$hOutput contract$0 $d(for scripts and agents)$0
+  - stdout carries only the image: one line per row, each exactly W columns
+    wide (UTF-8 with ANSI SGR color codes), then a final newline. No color
+    state carries over between lines, so lines can be used individually.
+  - Rows come from -H, else from the width and the image's aspect ratio
+    (cells are about twice as tall as wide). Both -w and -H given: stretch.
+  - With -w and -c given, output is deterministic for the same image.
+  - $b-c gray$0 in braille or ascii mode emits no escape codes at all.
+  - Transparent areas show the terminal background unless -b is given.
+  - Errors: one line \"hype: <message>\" on stderr and exit status 1.
+    A reader closing the pipe early is not an error.
+
+$hFormats:$0     {FORMATS} $d(this build)$0
+$hEnvironment:$0 COLORTERM=truecolor or 24bit enables 24-bit color by default;
+             NO_COLOR gives plain help text (image output is unaffected).
+
+$hExamples:$0
+  $bhype$0 logo.png                     $d# fit the terminal width$0
+  $bhype$0 icon.png -w 32 -H 16         $d# exactly 32x16 cells$0
+  $bhype$0 logo.png -w 60 -c 256        $d# for a 256-color terminal$0
+  $bhype$0 logo.png -m ascii -c gray    $d# plain ASCII, no escape codes$0
+  $bhype$0 logo.png -w 80 > logo.ans    $d# save now, show later with cat$0
+";
+
+fn print_help(color: ColorMode) {
+    // Styling and the logo are for humans at a terminal; captured output
+    // (an agent or script) gets the same text without escape codes.
+    let fancy = term::is_tty(1) && std::env::var_os("NO_COLOR").is_none();
+    let formats: Vec<&str> = [
+        ("PNG", cfg!(feature = "png")),
+        ("JPEG", cfg!(feature = "jpeg")),
+        ("GIF", cfg!(feature = "gif")),
+        ("WebP", cfg!(feature = "webp")),
+        ("BMP", cfg!(feature = "bmp")),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    let detected = match detect_color_support() {
+        ColorMode::True => "true",
+        _ => "256",
+    };
+    let style = |text: &str| {
+        let mut s = text
+            .replace("{VERSION}", VERSION)
+            .replace("{COLOR}", detected)
+            .replace("{FORMATS}", &formats.join(", "));
+        for (tag, esc) in [
+            ("$h", "\x1b[1;32m"),
+            ("$b", "\x1b[1m"),
+            ("$a", "\x1b[32m"),
+            ("$y", "\x1b[33m"),
+            ("$d", "\x1b[2m"),
+            ("$0", "\x1b[0m"),
+        ] {
+            s = s.replace(tag, if fancy { esc } else { "" });
+        }
+        s
+    };
+    let (top, rest) = (style(HELP_TOP), style(HELP_REST));
+
+    let logo: Vec<&str> = if color == ColorMode::True {
+        LOGO_TRUE
+    } else {
+        LOGO_256
+    }
+    .lines()
+    .collect();
+    let logo_width = logo.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+    let lines: Vec<&str> = top.lines().collect();
+    let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+    let gap = 4;
+
+    let mut out = String::new();
+    if fancy && term::width().unwrap_or(80) >= help_width + gap + logo_width {
+        let total = lines.len().max(logo.len());
+        let logo_offset = total.saturating_sub(logo.len()) / 2;
+        for i in 0..total {
+            let help = lines.get(i).copied().unwrap_or("");
+            let art = i
+                .checked_sub(logo_offset)
+                .and_then(|j| logo.get(j))
+                .copied()
+                .unwrap_or("");
+            let pad = help_width + gap - visible_width(help);
+            out.push_str(&format!("{help}{:pad$}{art}\x1b[0m\n", ""));
+        }
+    } else {
+        out.push_str(&top);
+    }
+    out.push_str(&rest);
+    emit(out.as_bytes());
+}
+
+/// Write to stdout. A consumer closing the pipe early is not an error worth
+/// reporting.
+fn emit(bytes: &[u8]) {
+    if let Err(e) = std::io::stdout().lock().write_all(bytes)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        eprintln!("hype: {e}");
+        process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,107 +483,5 @@ mod tests {
         assert!(parse_bg("10,20").is_err());
         assert!(parse_bg("10,20,300").is_err());
         assert!(parse_bg("").is_err());
-    }
-}
-
-/// Visible width of a string, skipping ANSI escape sequences.
-fn visible_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut in_esc = false;
-    for c in s.chars() {
-        if in_esc {
-            if c.is_ascii_alphabetic() {
-                in_esc = false;
-            }
-        } else if c == '\x1b' {
-            in_esc = true;
-        } else {
-            w += 1;
-        }
-    }
-    w
-}
-
-fn print_help(color: ColorMode) {
-    const GREEN: &str = "\x1b[32m";
-    const YELLOW: &str = "\x1b[33m";
-    const DIM: &str = "\x1b[2m";
-    const R: &str = "\x1b[0m";
-    const BG: &str = "\x1b[1;32m";
-    const BW: &str = "\x1b[1m";
-
-    let lines = vec![
-        format!("hype v{VERSION} \u{2014} terminal text art generator"),
-        String::new(),
-        format!("{BG}Usage:{R} {BW}hype{R} {GREEN}<IMAGE>{R} [OPTIONS]"),
-        String::new(),
-        format!("{BG}Options:{R}"),
-        format!(
-            "  {BW}-w{R}, {BW}--width{R} {GREEN}<N>{R}       Output width in columns {DIM}(default: terminal width){R}"
-        ),
-        format!(
-            "  {BW}-H{R}, {BW}--height{R} {GREEN}<N>{R}      Output height in rows {DIM}(default: auto from aspect ratio){R}"
-        ),
-        format!(
-            "  {BW}-m{R}, {BW}--mode{R} {GREEN}<MODE>{R}     block, braille, ascii {DIM}(default: block){R}"
-        ),
-        format!(
-            "  {BW}-c{R}, {BW}--color{R} {GREEN}<MODE>{R}    true, 256, gray {DIM}(default: true){R}"
-        ),
-        format!(
-            "  {BW}-d{R}, {BW}--dither{R} {GREEN}<TYPE>{R}   fs, ordered, none {DIM}(default: none; 256-color block-mode only){R}"
-        ),
-        format!(
-            "  {BW}-t{R}, {BW}--threshold{R} {GREEN}<N>{R}   Braille brightness threshold 0\u{2013}255 {DIM}(default: 40){R}"
-        ),
-        format!(
-            "  {BW}-b{R}, {BW}--bg{R} {GREEN}<COLOR>{R}      Alpha background: {YELLOW}black{R}, {YELLOW}white{R}, or {YELLOW}R,G,B{R} {DIM}(default: transparent){R}"
-        ),
-        format!("  {BW}-h{R}, {BW}--help{R}, {BW}help{R}      Show help"),
-        format!("  {BW}-v{R}, {BW}--version{R}         Show version"),
-    ];
-
-    let logo = if color == ColorMode::True {
-        LOGO_TRUE
-    } else {
-        LOGO_256
-    };
-    let logo_lines: Vec<&str> = logo.lines().collect();
-    let logo_width = logo_lines
-        .iter()
-        .map(|l| visible_width(l))
-        .max()
-        .unwrap_or(0);
-
-    let gap = 4;
-    let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
-    let needed = help_width + gap + logo_width;
-    let tw = terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80);
-
-    if tw >= needed && !logo_lines.is_empty() {
-        let total = lines.len().max(logo_lines.len());
-        let help_offset = 0;
-        let logo_offset = total.saturating_sub(logo_lines.len()) / 2;
-
-        for i in 0..total {
-            let help_part = if i >= help_offset && i - help_offset < lines.len() {
-                &lines[i - help_offset]
-            } else {
-                ""
-            };
-            let logo_part = if i >= logo_offset && i - logo_offset < logo_lines.len() {
-                logo_lines[i - logo_offset]
-            } else {
-                ""
-            };
-            let pad = help_width + gap - visible_width(help_part);
-            println!("{}{:pad$}{}\x1b[0m", help_part, "", logo_part, pad = pad);
-        }
-    } else {
-        for line in &lines {
-            println!("{line}");
-        }
     }
 }
