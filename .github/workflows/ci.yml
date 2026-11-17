@@ -18,9 +18,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Installs the toolchain and components pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
 
       - name: Format
         run: cargo fmt --check

@@ -52,7 +52,7 @@ impl Resampler {
         self.y += 1;
 
         for (bin, chunk) in self.bins.iter_mut().zip(rgba.chunks(self.kx * 4)) {
-            for p in chunk.chunks_exact(4) {
+            for p in chunk.as_chunks::<4>().0 {
                 let a = p[3] as u32;
                 bin[0] += p[0] as u32 * a;
                 bin[1] += p[1] as u32 * a;
@@ -217,8 +217,10 @@ impl Lanczos {
             // Four independent accumulators break the FMA dependency chain.
             let mut acc = [[0.0f32; 4]; 4];
             for (ps, ks) in self.row[s..s + taps]
-                .chunks_exact(4)
-                .zip(ws.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(ws.as_chunks::<4>().0)
             {
                 for i in 0..4 {
                     for c in 0..4 {
