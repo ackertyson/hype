@@ -240,7 +240,17 @@ pub fn render_block(
     bg: Option<(u8, u8, u8)>,
     out: &mut Vec<u8>,
 ) {
-    apply_bg(pixels, bg);
+    match bg {
+        Some(_) => apply_bg(pixels, bg),
+        // Transparent areas show the terminal background, so fade translucent
+        // edges toward it (assumed dark, as in braille and ascii) to keep
+        // silhouettes antialiased rather than ending in a full-color rim.
+        None => {
+            for p in pixels.iter_mut() {
+                (p.r, p.g, p.b) = alpha_blend(p.r, p.g, p.b, p.a, 0, 0, 0);
+            }
+        }
+    }
     if color_mode == ColorMode::Ansi256 && dither != Dither::None {
         return render_dithered(pixels, width, height, dither, out);
     }
@@ -736,6 +746,13 @@ mod tests {
         assert_eq!(s, "\x1b[38;2;255;0;0m▄\x1b[0m");
         let s = block(&cells(&["#.#....."], RED, CLEAR), 1);
         assert_eq!(s, "\x1b[38;2;255;0;0m▘\x1b[0m");
+    }
+
+    #[test]
+    fn block_translucent_fades_toward_dark() {
+        // A translucent edge is antialiased against the assumed-dark terminal.
+        let s = block(&cells(&["####...."], px(255, 0, 0, 191), CLEAR), 1);
+        assert_eq!(s, "\x1b[38;2;191;0;0m▀\x1b[0m");
     }
 
     fn braille(pixels: &[Pixel], cols: usize) -> String {
