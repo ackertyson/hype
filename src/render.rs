@@ -527,33 +527,152 @@ pub fn render_ascii(
     for row in 0..rows {
         for col in 0..width / 2 {
             let sub = cell(pixels, width, col, row);
-            let lum = sub.map(|p| lum1000(p.r, p.g, p.b));
-            // An edge is a cell the dark-background fit splits in two.
-            let mask = lit_mask(&sub, 0);
-            let &(ch, ink) = if mask != 0 && mask != 0xff {
-                // Edges get the glyph whose shape best matches the cell.
-                GLYPHS
-                    .iter()
-                    .min_by_key(|(_, cov)| {
-                        (0..8)
-                            .map(|i| (lum[i] as i32 / 1000 - cov[i] as i32).pow(2))
-                            .sum::<i32>()
-                    })
-                    .unwrap()
-            } else {
-                // Flat areas use the density ramp on the cell's mean luminance.
-                let mean = lum.iter().sum::<u32>() / 8;
-                &GLYPHS[(mean * (GLYPHS.len() as u32 - 1) / 255_000) as usize]
-            };
+            let &(ch, ink) = ascii_glyph(&sub);
+            if color_mode != ColorMode::Gray && ch != b' ' {
+                let k = sgr.key(ink_mean(&sub, &ink));
+                sgr.set(out, Some(k), DEFAULT);
+            }
+            out.push(ch);
+        }
+        sgr.end_line(out);
+        newline(out, row, rows);
+    }
+}
 
-            // Color the glyph by its ink, weighting subpixels by coverage.
-            let w: u32 = ink.iter().map(|&c| c as u32).sum();
-            if color_mode != ColorMode::Gray && w > 0 {
-                let avg = |f: fn(&Pixel) -> u8| {
-                    let s: u32 = (0..8).map(|i| f(&sub[i]) as u32 * ink[i] as u32).sum();
-                    (s / w) as u8
+/// ASCII mode's glyph for a cell.
+fn ascii_glyph(sub: &[Pixel; 8]) -> &'static (u8, [u8; 8]) {
+    let lum = sub.map(|p| lum1000(p.r, p.g, p.b));
+    // An edge is a cell the dark-background fit splits in two.
+    let mask = lit_mask(sub, 0);
+    if mask != 0 && mask != 0xff {
+        // Edges get the glyph whose shape best matches the cell.
+        GLYPHS
+            .iter()
+            .min_by_key(|(_, cov)| {
+                (0..8)
+                    .map(|i| (lum[i] as i32 / 1000 - cov[i] as i32).pow(2))
+                    .sum::<i32>()
+            })
+            .unwrap()
+    } else {
+        // Flat areas use the density ramp on the cell's mean luminance.
+        let mean = lum.iter().sum::<u32>() / 8;
+        &GLYPHS[(mean * (GLYPHS.len() as u32 - 1) / 255_000) as usize]
+    }
+}
+
+/// The cell's color under a glyph's ink, weighting subpixels by coverage.
+/// The glyph must have some ink.
+fn ink_mean(sub: &[Pixel; 8], ink: &[u8; 8]) -> Rgb {
+    let w: u32 = ink.iter().map(|&c| c as u32).sum();
+    let avg = |f: fn(&Pixel) -> u8| {
+        let s: u32 = (0..8).map(|i| f(&sub[i]) as u32 * ink[i] as u32).sum();
+        (s / w) as u8
+    };
+    (avg(|p| p.r), avg(|p| p.g), avg(|p| p.b))
+}
+
+/// Text for `render_text`: whitespace runs collapse to one space (also
+/// joining the end back to the start, as the text repeats), typographic
+/// quotes, dashes and ellipses become their ASCII forms, and anything else
+/// outside printable ASCII is dropped, so every character is one column.
+/// None if no printable character is left.
+pub fn prepare_text(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut space = false;
+    for c in String::from_utf8_lossy(bytes).chars() {
+        let ascii: &[u8] = match c {
+            '\u{2018}' | '\u{2019}' => b"'",
+            '\u{201c}' | '\u{201d}' => b"\"",
+            '\u{2013}' | '\u{2014}' => b"-",
+            '\u{2026}' => b"...",
+            c if c.is_whitespace() => {
+                space = true;
+                continue;
+            }
+            '!'..='~' => &[c as u8],
+            _ => continue,
+        };
+        if space && !out.is_empty() {
+            out.push(b' ');
+        }
+        space = false;
+        out.extend_from_slice(ascii);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.push(b' ');
+    Some(out)
+}
+
+/// Total ink of an average measured lowercase letter: text is shown as
+/// bright as such a letter would be in the cell's color.
+const REF_INK: u32 = {
+    let (mut sum, mut n, mut i) = (0, 0, 0);
+    while i < GLYPHS.len() {
+        if GLYPHS[i].0.is_ascii_lowercase() {
+            let mut j = 0;
+            while j < 8 {
+                sum += GLYPHS[i].1[j] as u32;
+                j += 1;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    sum / n
+};
+
+/// Scale `c` so a glyph with `ink` looks as bright as one with `REF_INK`
+/// would: thin glyphs are brightened and heavy ones dimmed. Brightening stops
+/// where the largest channel reaches 255, so the hue is kept.
+fn compensate((r, g, b): Rgb, ink: &[u8; 8]) -> Rgb {
+    let cov: u32 = ink.iter().map(|&c| c as u32).sum();
+    let max = r.max(g).max(b) as u32;
+    let (num, den) = if max * REF_INK > 255 * cov {
+        (255, max)
+    } else {
+        (REF_INK, cov)
+    };
+    let s = |v: u8| (v as u32 * num / den) as u8;
+    (s(r), s(g), s(b))
+}
+
+/// Render an image as the given text (from `prepare_text`): each cell that
+/// ASCII mode would not leave blank takes the next character, in reading
+/// order, colored by the image under its ink and brightness-compensated for
+/// its coverage. The text repeats if the image outlasts it.
+pub fn render_text(
+    pixels: &mut [Pixel],
+    width: usize,
+    height: usize,
+    color_mode: ColorMode,
+    bg: Option<(u8, u8, u8)>,
+    text: &[u8],
+    out: &mut Vec<u8>,
+) {
+    apply_bg(pixels, Some(bg.unwrap_or((0, 0, 0))));
+    let mut sgr = Sgr::new(color_mode);
+    let mut text = text.iter().copied().cycle();
+
+    let rows = height / 4;
+    for row in 0..rows {
+        for col in 0..width / 2 {
+            let sub = cell(pixels, width, col, row);
+            if ascii_glyph(&sub).0 == b' ' {
+                out.push(b' ');
+                continue;
+            }
+            let ch = text.next().unwrap_or(b' ');
+            if color_mode != ColorMode::Gray && ch != b' ' {
+                // Glyphs not in the measured table get the plain cell mean,
+                // unscaled: about right for a letter, as REF_INK is.
+                let c = match GLYPHS.iter().find(|(g, _)| *g == ch) {
+                    Some((_, ink)) => compensate(ink_mean(&sub, ink), ink),
+                    None => mean(&sub, 0xff),
                 };
-                let k = sgr.key((avg(|p| p.r), avg(|p| p.g), avg(|p| p.b)));
+                let k = sgr.key(c);
                 sgr.set(out, Some(k), DEFAULT);
             }
             out.push(ch);
@@ -875,5 +994,52 @@ mod tests {
         let black = px(0, 0, 0, 255);
         // Ink only in the bottom row reads as an underscore.
         assert_eq!(ascii(&cells(&["......##"], white, black), 1), b"_");
+    }
+
+    #[test]
+    fn prepare_text_collapses_and_maps() {
+        let t = prepare_text(
+            "  It\u{2019}s\n\n\tan \u{201c}end\u{201d}\u{2014}caf\u{e9}\u{2026} ".as_bytes(),
+        );
+        assert_eq!(t.unwrap(), b"It's an \"end\"-caf... ");
+        assert_eq!(prepare_text(b" \n\x01\t"), None);
+    }
+
+    fn text(pixels: &[Pixel], cols: usize, color: ColorMode, t: &[u8]) -> String {
+        let mut out = Vec::new();
+        let mut p = pixels.to_vec();
+        render_text(&mut p, cols * 2, 4, color, None, t, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn text_advances_only_in_lit_cells_and_repeats() {
+        let white = px(255, 255, 255, 255);
+        let black = px(0, 0, 0, 255);
+        let lit = "########";
+        let dark = "........";
+        let img = cells(&[lit, dark, lit, lit, dark, lit], white, black);
+        // Lit cells take a, b, the joining space, then the text repeats.
+        assert_eq!(text(&img, 6, ColorMode::Gray, b"ab "), "a b  a");
+    }
+
+    #[test]
+    fn text_compensates_coverage() {
+        // On the same gray, a thin glyph is drawn brighter than a heavy one,
+        // and a bright cell is capped at full white rather than wrapping.
+        let gray = cells(&["########"], px(100, 100, 100, 255), px(0, 0, 0, 255));
+        let thin = text(&gray, 1, ColorMode::True, b"i");
+        let heavy = text(&gray, 1, ColorMode::True, b"@");
+        let level = |s: &str| s[7..].split(';').next().unwrap().parse::<u32>().unwrap();
+        assert!(
+            level(&thin) > 100 && level(&heavy) < 100,
+            "{thin:?} {heavy:?}"
+        );
+
+        let white = cells(&["########"], px(255, 255, 255, 255), px(0, 0, 0, 255));
+        assert_eq!(
+            text(&white, 1, ColorMode::True, b"."),
+            "\x1b[38;2;255;255;255m.\x1b[0m"
+        );
     }
 }

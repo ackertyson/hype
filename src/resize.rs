@@ -96,18 +96,23 @@ impl Resampler {
 }
 
 /// Streaming separable Lanczos3 on premultiplied f32 rows: each row is
-/// filtered horizontally and immediately accumulated into every output row
-/// it contributes to.
+/// filtered horizontally into a ring of the last few, and each output row is
+/// gathered from the ring, and quantized, as soon as its last input row
+/// arrives. Only the 8-bit output is held in full.
 struct Lanczos {
     out_w: usize,
     out_h: usize,
     h: Weights,
     v: Weights,
     row: Vec<[f32; 4]>,
-    hrow: Vec<[f32; 4]>,
-    acc: Vec<[f32; 4]>,
+    /// Horizontally filtered input rows; input row `y` is in slot `y % slots`.
+    ring: Vec<[f32; 4]>,
+    slots: usize,
+    sum: Vec<[f32; 4]>,
+    out: Vec<Pixel>,
     y: usize,
-    first: usize,
+    /// Next output row to emit.
+    next: usize,
 }
 
 /// Filter weights for one axis, flattened to `taps` entries per output sample.
@@ -174,17 +179,21 @@ impl Lanczos {
     fn new(in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Self {
         let h = Weights::new(in_w, out_w);
         let v = Weights::new(in_h, out_h);
+        // Enough rows for the longest vertical window.
+        let slots = v.len.iter().copied().max().unwrap_or(1);
         Lanczos {
             out_w,
             out_h,
             // Padded so every output sample can read a full `taps` window.
             row: vec![[0.0; 4]; in_w + h.taps],
-            hrow: vec![[0.0; 4]; out_w],
-            acc: vec![[0.0; 4]; out_w * out_h],
+            ring: vec![[0.0; 4]; slots * out_w],
+            slots,
+            sum: vec![[0.0; 4]; out_w],
+            out: Vec::with_capacity(out_w * out_h),
             h,
             v,
             y: 0,
-            first: 0,
+            next: 0,
         }
     }
 
@@ -198,20 +207,15 @@ impl Lanczos {
         let y = self.y;
         self.y += 1;
 
-        // Skip output rows whose window ends above this input row.
-        while self.first < self.out_h && self.v.start[self.first] + self.v.len[self.first] <= y {
-            self.first += 1;
-        }
-        let mut last = self.first;
-        while last < self.out_h && self.v.start[last] <= y {
-            last += 1;
-        }
-        if last == self.first {
+        // Windows start in order, so a row above the next one's is unused.
+        if self.next == self.out_h || y < self.v.start[self.next] {
             return;
         }
 
         let taps = self.h.taps;
-        for (x, o) in self.hrow.iter_mut().enumerate() {
+        let slot = y % self.slots;
+        let hrow = &mut self.ring[slot * self.out_w..(slot + 1) * self.out_w];
+        for (x, o) in hrow.iter_mut().enumerate() {
             let s = self.h.start[x];
             let ws = &self.h.w[x * taps..(x + 1) * taps];
             // Four independent accumulators break the FMA dependency chain.
@@ -231,46 +235,53 @@ impl Lanczos {
             *o = std::array::from_fn(|c| (acc[0][c] + acc[1][c]) + (acc[2][c] + acc[3][c]));
         }
 
+        // Window ends are in order too: emit every output row this completes.
         let vtaps = self.v.taps;
-        for j in self.first..last {
-            let off = y - self.v.start[j];
-            if off >= self.v.len[j] {
-                continue;
-            }
-            let k = self.v.w[j * vtaps + off];
-            let dst = &mut self.acc[j * self.out_w..(j + 1) * self.out_w];
-            for (d, s) in dst.iter_mut().zip(&self.hrow) {
-                for c in 0..4 {
-                    d[c] += s[c] * k;
+        while self.next < self.out_h && self.v.start[self.next] + self.v.len[self.next] == y + 1 {
+            let j = self.next;
+            self.next += 1;
+            // Summed in input-row order, as a running accumulation would be.
+            self.sum.iter_mut().for_each(|s| *s = [0.0; 4]);
+            for off in 0..self.v.len[j] {
+                let k = self.v.w[j * vtaps + off];
+                let slot = (self.v.start[j] + off) % self.slots;
+                let src = &self.ring[slot * self.out_w..(slot + 1) * self.out_w];
+                for (d, s) in self.sum.iter_mut().zip(src) {
+                    for c in 0..4 {
+                        d[c] += s[c] * k;
+                    }
                 }
             }
+            self.out.extend(self.sum.iter().map(quantize));
         }
     }
 
-    /// Un-premultiply and quantize the accumulated output.
-    fn finish(self) -> Vec<Pixel> {
-        self.acc
-            .iter()
-            .map(|p| {
-                let a = p[3].clamp(0.0, 255.0);
-                if a < 0.5 {
-                    return Pixel {
-                        r: 0,
-                        g: 0,
-                        b: 0,
-                        a: 0,
-                    };
-                }
-                let inv = 255.0 / a;
-                let q = |v: f32| (v * inv).clamp(0.0, 255.0).round() as u8;
-                Pixel {
-                    r: q(p[0]),
-                    g: q(p[1]),
-                    b: q(p[2]),
-                    a: a.round() as u8,
-                }
-            })
-            .collect()
+    /// The output; rows never completed (input cut short) are transparent.
+    fn finish(mut self) -> Vec<Pixel> {
+        self.out
+            .resize(self.out_w * self.out_h, quantize(&[0.0; 4]));
+        self.out
+    }
+}
+
+/// Un-premultiply and quantize an output sample.
+fn quantize(p: &[f32; 4]) -> Pixel {
+    let a = p[3].clamp(0.0, 255.0);
+    if a < 0.5 {
+        return Pixel {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+    }
+    let inv = 255.0 / a;
+    let q = |v: f32| (v * inv).clamp(0.0, 255.0).round() as u8;
+    Pixel {
+        r: q(p[0]),
+        g: q(p[1]),
+        b: q(p[2]),
+        a: a.round() as u8,
     }
 }
 

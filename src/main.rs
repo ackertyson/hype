@@ -44,6 +44,17 @@ fn main() {
         process::exit(1);
     };
 
+    let text = opts.text.as_ref().map(|path| {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("hype: cannot read '{path}': {e}");
+            process::exit(1);
+        });
+        render::prepare_text(&bytes).unwrap_or_else(|| {
+            eprintln!("hype: '{path}' has no printable text");
+            process::exit(1);
+        })
+    });
+
     let term_width = term::width().unwrap_or(80);
     let mut img = open(base, |img_w, img_h| {
         target_size(opts.width, opts.height, term_width, img_w, img_h)
@@ -64,7 +75,10 @@ fn main() {
         Mode::Braille => {
             render::render_braille(px, w, h, opts.color, opts.threshold, opts.bg, &mut out)
         }
-        Mode::Ascii => render::render_ascii(px, w, h, opts.color, opts.bg, &mut out),
+        Mode::Ascii => match &text {
+            Some(t) => render::render_text(px, w, h, opts.color, opts.bg, t, &mut out),
+            None => render::render_ascii(px, w, h, opts.color, opts.bg, &mut out),
+        },
     }
     out.push(b'\n');
 
@@ -130,6 +144,7 @@ struct Opts {
     dither: Dither,
     threshold: u8,
     bg: Option<(u8, u8, u8)>,
+    text: Option<String>,
     help: bool,
     version: bool,
 }
@@ -157,9 +172,11 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         dither: Dither::None,
         threshold: 40,
         bg: None,
+        text: None,
         help: false,
         version: false,
     };
+    let mut mode = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -178,12 +195,16 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
             "-m" | "--mode" => {
                 i += 1;
                 let val = next_arg(args, i, "mode")?;
-                opts.mode = match val.as_str() {
+                mode = Some(match val.as_str() {
                     "block" => Mode::Block,
                     "braille" => Mode::Braille,
                     "ascii" => Mode::Ascii,
                     _ => return Err(format!("unknown mode '{val}' (block, braille, ascii)")),
-                };
+                });
+            }
+            "--text" => {
+                i += 1;
+                opts.text = Some(next_arg(args, i, "text")?);
             }
             "-c" | "--color" => {
                 i += 1;
@@ -227,6 +248,11 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         }
         i += 1;
     }
+    opts.mode = match (mode, &opts.text) {
+        (None | Some(Mode::Ascii), Some(_)) => Mode::Ascii,
+        (Some(_), Some(_)) => return Err("--text works in ascii mode only".into()),
+        (m, None) => m.unwrap_or(Mode::Block),
+    };
     // Several images are only layered when asked for, so a stray argument or
     // an unexpected glob match stays an error.
     if let [_, extra, ..] = &opts.images[..]
@@ -308,6 +334,7 @@ $hOptions:$0
   $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
   $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
+  $b--text$0 $a<FILE>$0         Draw the image with this text instead $d(implies ascii)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
@@ -316,6 +343,8 @@ $hModes:$0
   $yblock$0     Half blocks and quadrants, two colors per cell. Highest fidelity.
   $ybraille$0   2x4 dots per cell in one color; unlit dots show the background.
   $yascii$0     Printable ASCII only: density ramp, shape-matched at edges.
+            With --text, the file's text in reading order instead, one
+            character per non-blank cell, the image carried by color.
 ";
 
 const HELP_REST: &str = "
@@ -332,6 +361,9 @@ $hOutput contract$0 $d(for scripts and agents)$0
   - With -w and -c given, output is deterministic for the same image.
   - $b-c gray$0 in braille or ascii mode emits no escape codes at all.
   - Transparent areas show the terminal background unless -b is given.
+  - --text collapses whitespace to single spaces, maps typographic quotes,
+    dashes and ellipses to ASCII, drops other non-ASCII, and repeats the
+    text if the image outlasts it.
   - Errors: one line \"hype: <message>\" on stderr and exit status 1.
     A reader closing the pipe early is not an error.
 
@@ -346,6 +378,7 @@ $hExamples:$0
   $bhype$0 logo.png -m ascii -c gray    $d# plain ASCII, no escape codes$0
   $bhype$0 logo.png -w 80 > logo.ans    $d# save now, show later with cat$0
   $bhype$0 -l frame.png icon.png        $d# icon centered over frame$0
+  $bhype$0 logo.png --text chapter.txt  $d# the image drawn in a book's words$0
 ";
 
 fn print_help(color: ColorMode) {
@@ -519,6 +552,23 @@ mod tests {
             let opts = parse_args(&args(a), ColorMode::True).unwrap();
             assert_eq!(opts.images, ["a.png", "b.png", "c.png"]);
         }
+    }
+
+    #[test]
+    fn parse_args_text_implies_ascii() {
+        for a in [
+            &["img.png", "--text", "t.txt"][..],
+            &["--text", "t.txt", "-m", "ascii", "img.png"],
+        ] {
+            let opts = parse_args(&args(a), ColorMode::True).unwrap();
+            assert!(matches!(opts.mode, Mode::Ascii));
+            assert_eq!(opts.text.as_deref(), Some("t.txt"));
+        }
+        expect_err(
+            &["img.png", "--text", "t.txt", "-m", "block"],
+            "ascii mode only",
+        );
+        expect_err(&["img.png", "--text"], "missing value");
     }
 
     #[test]
