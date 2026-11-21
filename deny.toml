@@ -22,6 +22,11 @@ deny = [
     { name = "image" },
 ]
 
+[bans.build]
+# Build scripts run arbitrary code at build time; fail if any crate not
+# listed here gains one. crc32fast's only runs `rustc --version`.
+allow-build-scripts = [{ name = "crc32fast" }]
+
 [sources]
 # crates.io only: no git dependencies or other registries.
 unknown-registry = "deny"

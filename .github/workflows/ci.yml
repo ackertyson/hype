@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  # Weekly, so advisories published against already-locked dependencies
+  # surface without waiting for the next push.
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -15,9 +19,10 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Installs the toolchain and components pinned in rust-toolchain.toml.
       - name: Install Rust
         run: rustup toolchain install
@@ -53,5 +58,5 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
