@@ -45,14 +45,30 @@ fn main() {
     };
 
     let text = opts.text.as_ref().map(|path| {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| {
-            eprintln!("hype: cannot read '{path}': {e}");
+        let fail = |e: String| -> ! {
+            eprintln!("hype: {e}");
             process::exit(1);
-        });
-        render::prepare_text(&bytes).unwrap_or_else(|| {
-            eprintln!("hype: '{path}' has no printable text");
-            process::exit(1);
-        })
+        };
+        let (bytes, name) = if path == "-" {
+            // Waiting on keyboard input would look like a hang.
+            if term::is_tty(0) {
+                fail(
+                    "--text reads stdin, but stdin is a terminal (pipe text in, or give a file)"
+                        .into(),
+                );
+            }
+            let mut bytes = Vec::new();
+            if let Err(e) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes) {
+                fail(format!("cannot read stdin: {e}"));
+            }
+            (bytes, "stdin".to_string())
+        } else {
+            let bytes =
+                std::fs::read(path).unwrap_or_else(|e| fail(format!("cannot read '{path}': {e}")));
+            (bytes, format!("'{path}'"))
+        };
+        render::prepare_text(&bytes)
+            .unwrap_or_else(|| fail(format!("{name} has no printable text")))
     });
 
     let term_width = term::width().unwrap_or(80);
@@ -203,8 +219,14 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 });
             }
             "--text" => {
-                i += 1;
-                opts.text = Some(next_arg(args, i, "text")?);
+                // Without a file (last, or followed by an option): stdin.
+                opts.text = Some(match args.get(i + 1) {
+                    Some(f) if f == "-" || !f.starts_with('-') => {
+                        i += 1;
+                        f.clone()
+                    }
+                    _ => "-".into(),
+                });
             }
             "-c" | "--color" => {
                 i += 1;
@@ -334,7 +356,7 @@ $hOptions:$0
   $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
   $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
-  $b--text$0 $a<FILE>$0         Draw the image with this text instead $d(implies ascii)$0
+  $b--text$0 [$a<FILE>$0]       Draw the image with this text $d(stdin if - or none; implies ascii)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
@@ -379,6 +401,7 @@ $hExamples:$0
   $bhype$0 logo.png -w 80 > logo.ans    $d# save now, show later with cat$0
   $bhype$0 -l frame.png icon.png        $d# icon centered over frame$0
   $bhype$0 logo.png --text chapter.txt  $d# the image drawn in a book's words$0
+  $bfortune$0 | $bhype$0 logo.png --text    $d# ...or in piped text$0
 ";
 
 fn print_help(color: ColorMode) {
@@ -568,7 +591,16 @@ mod tests {
             &["img.png", "--text", "t.txt", "-m", "block"],
             "ascii mode only",
         );
-        expect_err(&["img.png", "--text"], "missing value");
+        // No file, or "-": stdin.
+        for a in [
+            &["img.png", "--text"][..],
+            &["img.png", "--text", "-w", "40"],
+            &["--text", "-", "img.png"],
+        ] {
+            let opts = parse_args(&args(a), ColorMode::True).unwrap();
+            assert_eq!(opts.text.as_deref(), Some("-"));
+            assert_eq!(opts.images, ["img.png"]);
+        }
     }
 
     #[test]
