@@ -9,8 +9,12 @@ compile_error!("enable at least one image format feature (png, jpeg, gif, webp, 
 
 mod color;
 mod decode;
+#[cfg(feature = "svg")]
+mod recursive;
 mod render;
 mod resize;
+#[cfg(feature = "svg")]
+mod svg;
 mod term;
 
 use render::{ColorMode, Dither};
@@ -85,22 +89,72 @@ fn main() {
     }
 
     let mut out = Vec::with_capacity(w * h * 12);
-    let px = &mut img.pixels;
     let bd = render::Backdrop {
         bg: opts.bg,
         light: opts.light,
     };
-    match opts.mode {
-        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, bd, &mut out),
-        Mode::Braille => render::render_braille(px, w, h, opts.color, opts.threshold, bd, &mut out),
-        Mode::Ascii => match &text {
-            Some(t) => render::render_text(px, w, h, opts.color, bd, t, &mut out),
-            None => render::render_ascii(px, w, h, opts.color, bd, &mut out),
-        },
+    if let Some(fit) = opts.svg {
+        svg_out(&mut img, &opts, fit, bd, text.as_deref(), &mut out);
+    } else {
+        render_text_art(&mut img, &opts, bd, text.as_deref(), &mut out);
     }
     out.push(b'\n');
 
     emit(&out);
+}
+
+fn render_text_art(
+    img: &mut decode::Image,
+    opts: &Opts,
+    bd: render::Backdrop,
+    text: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) {
+    let (w, h, px) = (img.width, img.height, &mut img.pixels);
+    match opts.mode {
+        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, bd, out),
+        Mode::Braille => render::render_braille(px, w, h, opts.color, opts.threshold, bd, out),
+        Mode::Ascii => match text {
+            Some(t) => render::render_text(px, w, h, opts.color, bd, t, out),
+            None => render::render_ascii(px, w, h, opts.color, bd, out),
+        },
+    }
+}
+
+#[cfg(feature = "svg")]
+fn svg_out(
+    img: &mut decode::Image,
+    opts: &Opts,
+    fit: Fit,
+    bd: render::Backdrop,
+    text: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) {
+    match opts.mode {
+        Mode::Braille => svg::braille(img, opts.color, opts.threshold, bd, out),
+        _ => svg::ascii(img, opts.color, bd, fit, text, out),
+    }
+}
+
+#[cfg(not(feature = "svg"))]
+fn svg_out(
+    _: &mut decode::Image,
+    _: &Opts,
+    _: Fit,
+    _: render::Backdrop,
+    _: Option<&[u8]>,
+    _: &mut Vec<u8>,
+) {
+    unreachable!("parse_args rejects --svg without the svg feature");
+}
+
+/// How `--svg` fits glyphs to their cells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fit {
+    /// Enlarged to fill the cell: more ink, so a wider tonal range.
+    Fill,
+    /// The font's own proportions.
+    Natural,
 }
 
 fn open(path: &str, size: impl Fn(usize, usize) -> (usize, usize)) -> decode::Image {
@@ -145,7 +199,7 @@ fn fit_size(canvas_w: usize, canvas_h: usize, img_w: usize, img_h: usize) -> (us
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Block,
     Braille,
@@ -164,6 +218,7 @@ struct Opts {
     bg: Option<(u8, u8, u8)>,
     light: bool,
     text: Option<String>,
+    svg: Option<Fit>,
     help: bool,
     version: bool,
 }
@@ -193,10 +248,12 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         bg: None,
         light: false,
         text: None,
+        svg: None,
         help: false,
         version: false,
     };
     let mut mode = None;
+    let mut color = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -235,12 +292,26 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
             "-c" | "--color" => {
                 i += 1;
                 let val = next_arg(args, i, "color")?;
-                opts.color = match val.as_str() {
+                color = Some(match val.as_str() {
                     "true" => ColorMode::True,
                     "256" => ColorMode::Ansi256,
                     "gray" | "grey" => ColorMode::Gray,
                     _ => return Err(format!("unknown color mode '{val}' (true, 256, gray)")),
-                };
+                });
+            }
+            "--svg" => {
+                // The fit is optional: only these words are taken as one.
+                opts.svg = Some(match args.get(i + 1).map(String::as_str) {
+                    Some("fill") => {
+                        i += 1;
+                        Fit::Fill
+                    }
+                    Some("natural") => {
+                        i += 1;
+                        Fit::Natural
+                    }
+                    _ => Fit::Fill,
+                });
             }
             "-d" | "--dither" => {
                 i += 1;
@@ -278,8 +349,22 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
     opts.mode = match (mode, &opts.text) {
         (None | Some(Mode::Ascii), Some(_)) => Mode::Ascii,
         (Some(_), Some(_)) => return Err("--text works in ascii mode only".into()),
+        // SVG draws ascii or braille, so it defaults to ascii.
+        (None, None) if opts.svg.is_some() => Mode::Ascii,
         (m, None) => m.unwrap_or(Mode::Block),
     };
+    if opts.svg.is_some() {
+        if !cfg!(feature = "svg") {
+            return Err("--svg is not in this build (cargo feature svg)".into());
+        }
+        if opts.mode == Mode::Block {
+            return Err("--svg draws ascii or braille mode, not block".into());
+        }
+        // A file has no terminal to detect: full color unless asked.
+        opts.color = color.unwrap_or(ColorMode::True);
+    } else if let Some(c) = color {
+        opts.color = c;
+    }
     // Several images are only layered when asked for, so a stray argument or
     // an unexpected glob match stays an error.
     if let [_, extra, ..] = &opts.images[..]
@@ -363,6 +448,7 @@ $hOptions:$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
   $b--light$0               Draw for a light background $d(light theme, or paper)$0
   $b--text$0 [$a<FILE>$0]       Draw the image with this text $d(stdin if - or none; implies ascii)$0
+  $b--svg$0 [$a<FIT>$0]         Vector SVG output $d(fit: fill or natural; default fill)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
@@ -394,7 +480,16 @@ $hOutput contract$0 $d(for scripts and agents)$0
     from it) and draw the rest in the image's colors.
   - --text collapses whitespace to single spaces, maps typographic quotes,
     dashes and ellipses to ASCII, drops other non-ASCII, and repeats the
-    text if the image outlasts it.
+    text if the image outlasts it. Underscores marking italics, as in
+    Project Gutenberg's _word_, are dropped (a paragraph break ends them);
+    --svg draws those words in italics.
+  - --svg ({SVG}) outputs one SVG document, then a final newline:
+    ascii (the default) or braille, each cell 1x2 units, blank cells left
+    as the background (black, or white with --light). Glyphs are from the
+    Recursive font (c) The Recursive Project Authors, SIL Open Font
+    License 1.1. fill enlarges them to fill their cells; natural keeps the
+    font's proportions. Full color unless -c is given; -c gray draws all
+    in one ink color.
   - Errors: one line \"hype: <message>\" on stderr and exit status 1.
     A reader closing the pipe early is not an error.
 
@@ -411,6 +506,7 @@ $hExamples:$0
   $bhype$0 -l frame.png icon.png        $d# icon centered over frame$0
   $bhype$0 logo.png --text chapter.txt  $d# the image drawn in a book's words$0
   $bfortune$0 | $bhype$0 logo.png --text    $d# ...or in piped text$0
+  $bhype$0 photo.jpg -w 200 --svg --light > print.svg  $d# vector art to print$0
 ";
 
 fn print_help(color: ColorMode, light: bool) {
@@ -435,7 +531,15 @@ fn print_help(color: ColorMode, light: bool) {
         let mut s = text
             .replace("{VERSION}", VERSION)
             .replace("{COLOR}", detected)
-            .replace("{FORMATS}", &formats.join(", "));
+            .replace("{FORMATS}", &formats.join(", "))
+            .replace(
+                "{SVG}",
+                if cfg!(feature = "svg") {
+                    "in this build"
+                } else {
+                    "not in this build"
+                },
+            );
         for (tag, esc) in [
             ("$h", "\x1b[1;32m"),
             ("$b", "\x1b[1m"),
@@ -613,6 +717,32 @@ mod tests {
             assert_eq!(opts.text.as_deref(), Some("-"));
             assert_eq!(opts.images, ["img.png"]);
         }
+    }
+
+    #[cfg(feature = "svg")]
+    #[test]
+    fn parse_args_svg() {
+        let opts = parse_args(&args(&["img.png", "--svg"]), ColorMode::Ansi256).unwrap();
+        assert_eq!(opts.svg, Some(Fit::Fill));
+        // Ascii by default, and full color rather than the terminal's.
+        assert!(opts.mode == Mode::Ascii);
+        assert_eq!(opts.color, ColorMode::True);
+        // The fit is taken only when it is one; anything else stays.
+        let opts = parse_args(&args(&["--svg", "natural", "img.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.svg, Some(Fit::Natural));
+        assert_eq!(opts.images, ["img.png"]);
+        let a = args(&["--svg", "img.png", "-m", "braille", "-c", "gray"]);
+        let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert_eq!(opts.svg, Some(Fit::Fill));
+        assert!(opts.mode == Mode::Braille);
+        assert_eq!(opts.color, ColorMode::Gray);
+        expect_err(&["img.png", "--svg", "-m", "block"], "not block");
+    }
+
+    #[cfg(not(feature = "svg"))]
+    #[test]
+    fn parse_args_svg_needs_feature() {
+        expect_err(&["img.png", "--svg"], "not in this build");
     }
 
     #[test]

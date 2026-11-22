@@ -39,7 +39,7 @@ pub struct Backdrop {
 
 impl Backdrop {
     /// The assumed background color.
-    fn paper(self) -> Rgb {
+    pub(crate) fn paper(self) -> Rgb {
         if self.light {
             (255, 255, 255)
         } else {
@@ -185,7 +185,7 @@ fn newline(out: &mut Vec<u8>, row: usize, rows: usize) {
 
 /// Every renderer samples each character cell as 2×4 subpixels, indexed
 /// `y * 2 + x`, and uses them to pick the glyph that best fits the cell.
-fn cell(pixels: &[Pixel], width: usize, col: usize, row: usize) -> [Pixel; 8] {
+pub(crate) fn cell(pixels: &[Pixel], width: usize, col: usize, row: usize) -> [Pixel; 8] {
     std::array::from_fn(|i| pixels[(row * 4 + i / 2) * width + col * 2 + i % 2])
 }
 
@@ -201,10 +201,10 @@ const SHAPES: [(u8, char, char); 7] = [
     (0xa5, '▚', '▞'),
 ];
 
-type Rgb = (u8, u8, u8);
+pub(crate) type Rgb = (u8, u8, u8);
 
 /// Mean color of the subpixels in `mask` (which must be non-empty).
-fn mean(sub: &[Pixel; 8], mask: u8) -> Rgb {
+pub(crate) fn mean(sub: &[Pixel; 8], mask: u8) -> Rgb {
     let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
     for (i, p) in sub.iter().enumerate() {
         if mask >> i & 1 == 1 {
@@ -395,7 +395,7 @@ fn render_dithered(
 /// sees as brightness is then ink, and `Sgr` inverts the colors back on
 /// output. Every decision carries over exactly, as `color_dist` depends only
 /// on channel differences and `lum1000` is linear.
-fn flatten(pixels: &mut [Pixel], backdrop: Backdrop) {
+pub(crate) fn flatten(pixels: &mut [Pixel], backdrop: Backdrop) {
     let (br, bg, bb) = backdrop.bg.unwrap_or(backdrop.paper());
     for p in pixels {
         let (r, g, b) = alpha_blend(p.r, p.g, p.b, p.a, br, bg, bb);
@@ -424,7 +424,7 @@ fn flat_sgr(color_mode: ColorMode, backdrop: Backdrop) -> Sgr {
 /// rest to the background (black, after `flatten`). Starting from those
 /// brighter than `limit`, a subpixel stays lit only if the lit subpixels'
 /// mean color represents it better than black does.
-fn lit_mask(sub: &[Pixel; 8], limit: u32) -> u8 {
+pub(crate) fn lit_mask(sub: &[Pixel; 8], limit: u32) -> u8 {
     let bright = (0..8).fold(0u8, |m, i| {
         let p = sub[i];
         m | ((lum1000(p.r, p.g, p.b) > limit) as u8) << i
@@ -585,7 +585,7 @@ pub fn render_ascii(
     for row in 0..rows {
         for col in 0..width / 2 {
             let sub = cell(pixels, width, col, row);
-            let &(ch, ink) = ascii_glyph(&sub);
+            let &(ch, ink) = ascii_glyph(&sub, &GLYPHS);
             if color_mode != ColorMode::Gray && ch != b' ' {
                 let k = sgr.key(ink_mean(&sub, &ink));
                 sgr.set(out, Some(k), DEFAULT);
@@ -597,15 +597,20 @@ pub fn render_ascii(
     }
 }
 
-/// ASCII mode's glyph for a cell.
-fn ascii_glyph(sub: &[Pixel; 8]) -> &'static (u8, [u8; 8]) {
+/// A glyph and its ink coverage over a cell's 2×4 subpixels.
+type Glyph = (u8, [u8; 8]);
+
+/// ASCII mode's glyph for a cell, from a density `ramp` like `GLYPHS`: the
+/// first entry is blank, the rest by increasing mean coverage. Entries are
+/// (label, coverage); only the coverage is read, so a label can carry more
+/// than the character (svg.rs adds the font weight).
+pub(crate) fn ascii_glyph<'a, L>(sub: &[Pixel; 8], ramp: &'a [(L, [u8; 8])]) -> &'a (L, [u8; 8]) {
     let lum = sub.map(|p| lum1000(p.r, p.g, p.b));
     // An edge is a cell the dark-background fit splits in two.
     let mask = lit_mask(sub, 0);
     if mask != 0 && mask != 0xff {
         // Edges get the glyph whose shape best matches the cell.
-        GLYPHS
-            .iter()
+        ramp.iter()
             .min_by_key(|(_, cov)| {
                 (0..8)
                     .map(|i| (lum[i] as i32 / 1000 - cov[i] as i32).pow(2))
@@ -615,13 +620,13 @@ fn ascii_glyph(sub: &[Pixel; 8]) -> &'static (u8, [u8; 8]) {
     } else {
         // Flat areas use the density ramp on the cell's mean luminance.
         let mean = lum.iter().sum::<u32>() / 8;
-        &GLYPHS[(mean * (GLYPHS.len() as u32 - 1) / 255_000) as usize]
+        &ramp[(mean * (ramp.len() as u32 - 1) / 255_000) as usize]
     }
 }
 
 /// The cell's color under a glyph's ink, weighting subpixels by coverage.
 /// The glyph must have some ink.
-fn ink_mean(sub: &[Pixel; 8], ink: &[u8; 8]) -> Rgb {
+pub(crate) fn ink_mean(sub: &[Pixel; 8], ink: &[u8; 8]) -> Rgb {
     let w: u32 = ink.iter().map(|&c| c as u32).sum();
     let avg = |f: fn(&Pixel) -> u8| {
         let s: u32 = (0..8).map(|i| f(&sub[i]) as u32 * ink[i] as u32).sum();
@@ -630,15 +635,44 @@ fn ink_mean(sub: &[Pixel; 8], ink: &[u8; 8]) -> Rgb {
     (avg(|p| p.r), avg(|p| p.g), avg(|p| p.b))
 }
 
+/// Marks an italic character in `prepare_text`'s output (bit 7: the text is
+/// otherwise printable ASCII).
+pub const ITALIC: u8 = 0x80;
+
 /// Text for `render_text`: whitespace runs collapse to one space (also
 /// joining the end back to the start, as the text repeats), typographic
 /// quotes, dashes and ellipses become their ASCII forms, and anything else
 /// outside printable ASCII is dropped, so every character is one column.
-/// None if no printable character is left.
+/// Underscores marking italics, as in Project Gutenberg's `_word_`, are
+/// dropped and the characters between them marked `ITALIC`. None if no
+/// printable character is left.
 pub fn prepare_text(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut space = false;
-    for c in String::from_utf8_lossy(bytes).chars() {
+    let chars: Vec<char> = String::from_utf8_lossy(bytes).chars().collect();
+    let mut out = Vec::with_capacity(chars.len());
+    let (mut space, mut italic, mut newlines) = (false, false, 0);
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    let blank = |c: Option<&char>| c.is_none_or(|c| c.is_whitespace());
+    for (i, &c) in chars.iter().enumerate() {
+        // A paragraph break ends italics, so a stray underscore cannot run
+        // on through the rest of the text.
+        if c == '\n' {
+            newlines += 1;
+            italic &= newlines < 2;
+        } else if !c.is_whitespace() {
+            newlines = 0;
+        }
+        if c == '_' {
+            // Markup opens at the start of a word and closes at the end of
+            // one; any other underscore (snake_case, a lone _) is literal.
+            let (prev, next) = (
+                i.checked_sub(1).and_then(|j| chars.get(j)),
+                chars.get(i + 1),
+            );
+            if !italic && !word(prev) && !blank(next) || italic && !blank(prev) && !word(next) {
+                italic = !italic;
+                continue;
+            }
+        }
         let ascii: &[u8] = match c {
             '\u{2018}' | '\u{2019}' => b"'",
             '\u{201c}' | '\u{201d}' => b"\"",
@@ -651,11 +685,13 @@ pub fn prepare_text(bytes: &[u8]) -> Option<Vec<u8>> {
             '!'..='~' => &[c as u8],
             _ => continue,
         };
-        if space && !out.is_empty() {
-            out.push(b' ');
+        let flag = if italic { ITALIC } else { 0 };
+        if let Some(&last) = out.last().filter(|_| space) {
+            // Italic only between italic words.
+            out.push(b' ' | (flag & last));
         }
         space = false;
-        out.extend_from_slice(ascii);
+        out.extend(ascii.iter().map(|&b| b | flag));
     }
     if out.is_empty() {
         return None;
@@ -664,15 +700,15 @@ pub fn prepare_text(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Total ink of an average measured lowercase letter: text is shown as
+/// Total ink of an average lowercase letter in `table`: text is shown as
 /// bright as such a letter would be in the cell's color.
-const REF_INK: u32 = {
+const fn ref_ink(table: &[Glyph]) -> u32 {
     let (mut sum, mut n, mut i) = (0, 0, 0);
-    while i < GLYPHS.len() {
-        if GLYPHS[i].0.is_ascii_lowercase() {
+    while i < table.len() {
+        if table[i].0.is_ascii_lowercase() {
             let mut j = 0;
             while j < 8 {
-                sum += GLYPHS[i].1[j] as u32;
+                sum += table[i].1[j] as u32;
                 j += 1;
             }
             n += 1;
@@ -680,19 +716,21 @@ const REF_INK: u32 = {
         i += 1;
     }
     sum / n
-};
+}
 
-/// Scale `c` so a glyph with `ink` looks as bright as one with `REF_INK`
+const REF_INK: u32 = ref_ink(&GLYPHS);
+
+/// Scale `c` so a glyph with `ink` looks as bright as one with `ref_ink`
 /// would: thin glyphs are brightened and heavy ones dimmed. Brightening stops
 /// where the largest channel reaches 255, so the hue is kept. On a light
 /// background `c` is inverted (`flatten`), so thin glyphs get darker ink.
-fn compensate((r, g, b): Rgb, ink: &[u8; 8]) -> Rgb {
+pub(crate) fn compensate((r, g, b): Rgb, ink: &[u8; 8], ref_ink: u32) -> Rgb {
     let cov: u32 = ink.iter().map(|&c| c as u32).sum();
     let max = r.max(g).max(b) as u32;
-    let (num, den) = if max * REF_INK > 255 * cov {
+    let (num, den) = if max * ref_ink > 255 * cov {
         (255, max)
     } else {
-        (REF_INK, cov)
+        (ref_ink, cov)
     };
     let s = |v: u8| (v as u32 * num / den) as u8;
     (s(r), s(g), s(b))
@@ -719,16 +757,17 @@ pub fn render_text(
     for row in 0..rows {
         for col in 0..width / 2 {
             let sub = cell(pixels, width, col, row);
-            if ascii_glyph(&sub).0 == b' ' {
+            if ascii_glyph(&sub, &GLYPHS).0 == b' ' {
                 out.push(b' ');
                 continue;
             }
-            let ch = text.next().unwrap_or(b' ');
+            // The terminal draws italics upright.
+            let ch = text.next().unwrap_or(b' ') & !ITALIC;
             if color_mode != ColorMode::Gray && ch != b' ' {
                 // Glyphs not in the measured table get the plain cell mean,
                 // unscaled: about right for a letter, as REF_INK is.
                 let c = match GLYPHS.iter().find(|(g, _)| *g == ch) {
-                    Some((_, ink)) => compensate(ink_mean(&sub, ink), ink),
+                    Some((_, ink)) => compensate(ink_mean(&sub, ink), ink, REF_INK),
                     None => mean(&sub, 0xff),
                 };
                 let k = sgr.key(c);
@@ -1156,6 +1195,32 @@ mod tests {
         );
         assert_eq!(t.unwrap(), b"It's an \"end\"-caf... ");
         assert_eq!(prepare_text(b" \n\x01\t"), None);
+    }
+
+    /// `prepare_text`'s output with italic characters shown in brackets.
+    fn marked(s: &str) -> String {
+        let mut out = String::new();
+        let mut on = false;
+        for b in prepare_text(s.as_bytes()).unwrap() {
+            if (b & ITALIC != 0) != on {
+                on = !on;
+                out.push(if on { '[' } else { ']' });
+            }
+            out.push((b & !ITALIC) as char);
+        }
+        out
+    }
+
+    #[test]
+    fn prepare_text_italics() {
+        // Gutenberg markup: words and runs, beside punctuation, across lines.
+        assert_eq!(marked("so _very_ remarkable"), "so [very] remarkable ");
+        assert_eq!(marked("\"_Alice!_\" she"), "\"[Alice!]\" she ");
+        assert_eq!(marked("_two\nlines_ end"), "[two lines] end ");
+        // Literal underscores stay.
+        assert_eq!(marked("snake_case a _ b x_"), "snake_case a _ b x_ ");
+        // A stray opener ends at the paragraph.
+        assert_eq!(marked("_stray\n\nnext"), "[stray] next ");
     }
 
     fn text_on(

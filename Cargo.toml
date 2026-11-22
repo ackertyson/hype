@@ -13,6 +13,10 @@ jpeg = ["dep:zune-jpeg", "dep:zune-core"]
 gif = ["dep:gif"]
 webp = ["dep:image-webp"]
 bmp = []
+# SVG output (--svg) with glyphs from the Recursive font (SIL OFL 1.1,
+# LICENSE-Recursive.txt): adds about 450 KB, mostly outline data for five
+# weights, upright and italic.
+svg = []
 
 [dependencies]
 png = { version = "0.18", optional = true }
