@@ -31,7 +31,7 @@ fn main() {
     };
 
     if opts.help {
-        print_help(opts.color);
+        print_help(opts.color, opts.light);
         return;
     }
     if opts.version {
@@ -86,14 +86,16 @@ fn main() {
 
     let mut out = Vec::with_capacity(w * h * 12);
     let px = &mut img.pixels;
+    let bd = render::Backdrop {
+        bg: opts.bg,
+        light: opts.light,
+    };
     match opts.mode {
-        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, opts.bg, &mut out),
-        Mode::Braille => {
-            render::render_braille(px, w, h, opts.color, opts.threshold, opts.bg, &mut out)
-        }
+        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, bd, &mut out),
+        Mode::Braille => render::render_braille(px, w, h, opts.color, opts.threshold, bd, &mut out),
         Mode::Ascii => match &text {
-            Some(t) => render::render_text(px, w, h, opts.color, opts.bg, t, &mut out),
-            None => render::render_ascii(px, w, h, opts.color, opts.bg, &mut out),
+            Some(t) => render::render_text(px, w, h, opts.color, bd, t, &mut out),
+            None => render::render_ascii(px, w, h, opts.color, bd, &mut out),
         },
     }
     out.push(b'\n');
@@ -160,6 +162,7 @@ struct Opts {
     dither: Dither,
     threshold: u8,
     bg: Option<(u8, u8, u8)>,
+    light: bool,
     text: Option<String>,
     help: bool,
     version: bool,
@@ -188,6 +191,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         dither: Dither::None,
         threshold: 40,
         bg: None,
+        light: false,
         text: None,
         help: false,
         version: false,
@@ -261,6 +265,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 let val = next_arg(args, i, "bg")?;
                 opts.bg = Some(parse_bg(&val)?);
             }
+            "--light" => opts.light = true,
             other => {
                 if other.starts_with('-') {
                     return Err(format!("unknown option '{other}'"));
@@ -354,8 +359,9 @@ $hOptions:$0
   $b-m$0, $b--mode$0 $a<MODE>$0     $yblock$0, $ybraille$0, $yascii$0 $d(default: block)$0
   $b-c$0, $b--color$0 $a<MODE>$0    $ytrue$0, $y256$0, $ygray$0 $d(default: auto-detected, here {COLOR})$0
   $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
-  $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
+  $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots fainter than N stay unlit $d(default: 40)$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
+  $b--light$0               Draw for a light background $d(light theme, or paper)$0
   $b--text$0 [$a<FILE>$0]       Draw the image with this text $d(stdin if - or none; implies ascii)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
@@ -383,6 +389,9 @@ $hOutput contract$0 $d(for scripts and agents)$0
   - With -w and -c given, output is deterministic for the same image.
   - $b-c gray$0 in braille or ascii mode emits no escape codes at all.
   - Transparent areas show the terminal background unless -b is given.
+  - The terminal background is assumed dark, or light with --light. Braille
+    and ascii leave areas close to it blank (\"fainter\" in -t is measured
+    from it) and draw the rest in the image's colors.
   - --text collapses whitespace to single spaces, maps typographic quotes,
     dashes and ellipses to ASCII, drops other non-ASCII, and repeats the
     text if the image outlasts it.
@@ -404,7 +413,7 @@ $hExamples:$0
   $bfortune$0 | $bhype$0 logo.png --text    $d# ...or in piped text$0
 ";
 
-fn print_help(color: ColorMode) {
+fn print_help(color: ColorMode, light: bool) {
     // Styling and the logo are for humans at a terminal; captured output
     // (an agent or script) gets the same text without escape codes.
     let fancy = term::is_tty(1) && std::env::var_os("NO_COLOR").is_none();
@@ -440,6 +449,7 @@ fn print_help(color: ColorMode) {
         s
     };
     let help = style(HELP_TOP) + &style(HELP_REST);
+    let bd = render::Backdrop { bg: None, light };
 
     let lines: Vec<&str> = help.lines().collect();
     let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
@@ -447,7 +457,7 @@ fn print_help(color: ColorMode) {
     let room = term::width().unwrap_or(80).saturating_sub(help_width + gap);
 
     let mut out = String::new();
-    match fancy.then(|| logo(room, lines.len(), color)).flatten() {
+    match fancy.then(|| logo(room, lines.len(), color, bd)).flatten() {
         Some(logo) => {
             // The logo is never taller than the help; center it beside it.
             let art: Vec<&str> = logo.lines().collect();
@@ -466,7 +476,7 @@ fn print_help(color: ColorMode) {
 /// The logo, rendered by hype itself as large as fits beside the help text:
 /// `cols` wide, unless that would be more than `rows` tall. None if there is
 /// too little room or this build lacks PNG.
-fn logo(cols: usize, rows: usize, color: ColorMode) -> Option<String> {
+fn logo(cols: usize, rows: usize, color: ColorMode, bd: render::Backdrop) -> Option<String> {
     if !cfg!(feature = "png") || cols < 16 {
         return None;
     }
@@ -481,7 +491,7 @@ fn logo(cols: usize, rows: usize, color: ColorMode) -> Option<String> {
     .ok()?;
     let (w, h) = (img.width, img.height);
     let mut out = Vec::new();
-    render::render_block(&mut img.pixels, w, h, color, Dither::None, None, &mut out);
+    render::render_block(&mut img.pixels, w, h, color, Dither::None, bd, &mut out);
     String::from_utf8(out).ok()
 }
 
@@ -511,15 +521,17 @@ mod tests {
         assert_eq!(opts.images, ["photo.png"]);
         assert!(!opts.help);
         assert!(!opts.version);
+        assert!(!opts.light);
     }
 
     #[test]
     fn parse_args_all_flags() {
         let a = args(&[
             "img.jpg", "-w", "120", "-H", "40", "-m", "braille", "-c", "256", "-d", "fs", "-t",
-            "100", "-b", "white",
+            "100", "-b", "white", "--light",
         ]);
         let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert!(opts.light);
         assert_eq!(opts.width, Some(120));
         assert_eq!(opts.height, Some(40));
         assert!(matches!(opts.mode, Mode::Braille));

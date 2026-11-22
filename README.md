@@ -57,6 +57,7 @@ Run `hype help`. The help includes an exact output contract for scripts and agen
 
 ### Other capabilities
 
+- **Light backgrounds** — Braille and ASCII assume a dark terminal. With `--light` they draw for a light one instead (a light theme, or paper): areas close to the background are left blank, the rest is drawn in the image's own colors, and thin ASCII glyphs get darker ink to match heavy ones.
 - **Alpha compositing** — Transparent regions can be composited against a configurable background color (black, white, or any RGB value). Without a background, transparency is preserved as the terminal's own background.
 - **Auto-sizing** — Output dimensions default to the terminal width with aspect ratio preserved. Width and height can also be set explicitly.
 - **Input image format support** — PNG and JPEG by default; GIF, WebP, and BMP via cargo features.
