@@ -131,8 +131,8 @@ fn svg_out(
     out: &mut Vec<u8>,
 ) {
     match opts.mode {
-        Mode::Braille => svg::braille(img, opts.color, opts.threshold, bd, out),
-        _ => svg::ascii(img, opts.color, bd, fit, text, out),
+        Mode::Braille => svg::braille(img, opts.color, opts.threshold, bd, opts.tint, out),
+        _ => svg::ascii(img, opts.color, bd, fit, text, opts.tint, out),
     }
 }
 
@@ -219,6 +219,8 @@ struct Opts {
     light: bool,
     text: Option<String>,
     svg: Option<Fit>,
+    /// `--tint` strength, percent of the ink (0: off).
+    tint: u32,
     help: bool,
     version: bool,
 }
@@ -249,6 +251,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         light: false,
         text: None,
         svg: None,
+        tint: 0,
         help: false,
         version: false,
     };
@@ -313,6 +316,17 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                     _ => Fit::Fill,
                 });
             }
+            "--tint" => {
+                // The strength is optional: taken only if it is a number.
+                opts.tint = match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                    Some(n) if n <= 100 => {
+                        i += 1;
+                        n
+                    }
+                    Some(_) => return Err("tint must be 0-100".into()),
+                    None => 50,
+                };
+            }
             "-d" | "--dither" => {
                 i += 1;
                 let val = next_arg(args, i, "dither")?;
@@ -362,6 +376,8 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         }
         // A file has no terminal to detect: full color unless asked.
         opts.color = color.unwrap_or(ColorMode::True);
+    } else if opts.tint > 0 {
+        return Err("--tint works with --svg only".into());
     } else if let Some(c) = color {
         opts.color = c;
     }
@@ -449,6 +465,7 @@ $hOptions:$0
   $b--light$0               Draw for a light background $d(light theme, or paper)$0
   $b--text$0 [$a<FILE>$0]       Draw the image with this text $d(stdin if - or none; implies ascii)$0
   $b--svg$0 [$a<FIT>$0]         Vector SVG output $d(fit: fill or natural; default fill)$0
+  $b--tint$0 [$a<N>$0]          SVG: tint cells to carry tone glyphs can't $d(0-100, default 50)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
@@ -489,7 +506,10 @@ $hOutput contract$0 $d(for scripts and agents)$0
     Recursive font (c) The Recursive Project Authors, SIL Open Font
     License 1.1. fill enlarges them to fill their cells; natural keeps the
     font's proportions. Full color unless -c is given; -c gray draws all
-    in one ink color.
+    in one ink color. --tint N fills each drawn cell (and --text word
+    spaces) behind its glyph with the tone the glyph lacks, at most N% of
+    the ink's depth from the background, so the image reads from a
+    distance; gray tints are gray.
   - Errors: one line \"hype: <message>\" on stderr and exit status 1.
     A reader closing the pipe early is not an error.
 
@@ -737,6 +757,17 @@ mod tests {
         assert!(opts.mode == Mode::Braille);
         assert_eq!(opts.color, ColorMode::Gray);
         expect_err(&["img.png", "--svg", "-m", "block"], "not block");
+        // --tint: off unless given, 50 without a number.
+        assert_eq!(opts.tint, 0);
+        let opts = parse_args(&args(&["--svg", "--tint", "img.png"]), ColorMode::True).unwrap();
+        assert_eq!(
+            (opts.tint, &opts.images[..]),
+            (50, &["img.png".to_string()][..])
+        );
+        let opts = parse_args(&args(&["--svg", "--tint", "30", "x.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.tint, 30);
+        expect_err(&["img.png", "--svg", "--tint", "101"], "0-100");
+        expect_err(&["img.png", "--tint"], "--svg only");
     }
 
     #[cfg(not(feature = "svg"))]

@@ -19,7 +19,7 @@ use crate::recursive::{
     FILL_TRANSFORM, ITALIC_FILL, ITALIC_NATURAL, ITALIC_PATHS, NATURAL_TRANSFORM, OTHER_FILL,
     OTHER_NATURAL, PATHS, RAMP_FILL, RAMP_NATURAL, WEIGHTS,
 };
-use crate::render::{self, Backdrop, ColorMode, Rgb};
+use crate::render::{self, Backdrop, ColorMode, Pixel, Rgb};
 use std::io::Write;
 
 /// A glyph, labeled (character, index into `WEIGHTS`), and its coverage.
@@ -89,12 +89,35 @@ const FILLED: Tables = Tables {
 
 /// Braille dot radius, in cells (a subpixel is 0.5 across).
 const DOT_R: &str = "0.22";
+/// A dot's coverage of its subpixel, of 255: π·0.22² / 0.5².
+const DOT_COV: u8 = 155;
 /// Subpixel centers, in cells: x by column, y by row.
 const DOT_X: [&str; 2] = ["0.25", "0.75"];
 const DOT_Y: [&str; 4] = ["0.25", "0.75", "1.25", "1.75"];
 
-/// A drawn cell: column, row, shape, and color (None: the single ink color).
-type Mark = (usize, usize, Shape, Option<Rgb>);
+/// A drawn cell: column, row, shape (None: tint only), color (None: the
+/// single ink color), and background tint.
+type Mark = (usize, usize, Option<Shape>, Option<Rgb>, Option<Rgb>);
+
+/// Background tint for a cell (in `flatten`ed space, like `ink`): the share
+/// of the cell's tone its glyph cannot carry, spread over the uncovered
+/// area, but at most `strength`/100 of the ink in each channel so the glyph
+/// stays legible. `cov` is the glyph's coverage (zeros for none). None if
+/// nothing would show.
+fn tint(sub: &[Pixel; 8], cov: &[u8; 8], ink: Rgb, strength: u32) -> Option<Rgb> {
+    let covered: u32 = cov.iter().map(|&c| c as u32).sum();
+    let open = 8 * 255 - covered;
+    if open == 0 || strength == 0 {
+        return None;
+    }
+    let ch = |f: fn(&Pixel) -> u8, ink: u8| {
+        let want: u32 = sub.iter().map(|p| f(p) as u32 * 255).sum();
+        let deficit = want.saturating_sub(covered * ink as u32) / open;
+        deficit.min(ink as u32 * strength / 100) as u8
+    };
+    let t = (ch(|p| p.r, ink.0), ch(|p| p.g, ink.1), ch(|p| p.b, ink.2));
+    (t != (0, 0, 0)).then_some(t)
+}
 
 /// A glyph by its (character, weight index), upright or italic, or a
 /// braille cell by its subpixel mask.
@@ -144,6 +167,7 @@ pub fn ascii(
     backdrop: Backdrop,
     fit: Fit,
     text: Option<&[u8]>,
+    tint_pct: u32,
     out: &mut Vec<u8>,
 ) {
     let t = match fit {
@@ -161,13 +185,20 @@ pub fn ascii(
             if g.0 == b' ' {
                 continue;
             }
-            let (shape, c) = match &mut text {
-                None => (Shape::Glyph(g), render::ink_mean(&sub, &cov)),
+            let (shape, c, cov) = match &mut text {
+                None => (Some(Shape::Glyph(g)), render::ink_mean(&sub, &cov), cov),
                 Some(text) => {
                     let ch = text.next().unwrap_or(b' ');
                     let italic = ch & render::ITALIC != 0;
                     let ch = ch & !render::ITALIC;
                     if ch == b' ' {
+                        // A word space is still tinted, as if an average
+                        // letter were there, so the tint has no holes.
+                        let m = render::mean(&sub, 0xff);
+                        let bg = shade(&sub, &[0; 8], m, tint_pct, color, backdrop);
+                        if bg.is_some() {
+                            marks.push((col, row, None, None, bg));
+                        }
                         continue;
                     }
                     let (refs, table) = if italic {
@@ -193,13 +224,32 @@ pub fn ascii(
                     } else {
                         Shape::Glyph(g)
                     };
-                    (shape, c)
+                    (Some(shape), c, *cov)
                 }
             };
-            marks.push((col, row, shape, ink(c, color, backdrop)));
+            let bg = shade(&sub, &cov, c, tint_pct, color, backdrop);
+            marks.push((col, row, shape, ink(c, color, backdrop), bg));
         }
     }
     write(out, cols, rows, &marks, backdrop, t);
+}
+
+/// `tint`, drawn as `ink` draws colors; in gray the ink is solid, so the
+/// tint is gray.
+fn shade(
+    sub: &[Pixel; 8],
+    cov: &[u8; 8],
+    c: Rgb,
+    strength: u32,
+    color: ColorMode,
+    backdrop: Backdrop,
+) -> Option<Rgb> {
+    if color == ColorMode::Gray {
+        let t = tint(sub, cov, (255, 255, 255), strength)?;
+        let l = (crate::color::lum1000(t.0, t.1, t.2) / 1000) as u8;
+        return ink((l, l, l), ColorMode::True, backdrop);
+    }
+    ink(tint(sub, cov, c, strength)?, color, backdrop)
 }
 
 /// Braille mode as SVG: lit dots as circles.
@@ -208,6 +258,7 @@ pub fn braille(
     color: ColorMode,
     threshold: u8,
     backdrop: Backdrop,
+    tint_pct: u32,
     out: &mut Vec<u8>,
 ) {
     render::flatten(&mut img.pixels, backdrop);
@@ -219,8 +270,16 @@ pub fn braille(
             let sub = render::cell(&img.pixels, img.width, col, row);
             let mask = render::lit_mask(&sub, limit);
             if mask != 0 {
-                let c = ink(render::mean(&sub, mask), color, backdrop);
-                marks.push((col, row, Shape::Dots(mask), c));
+                let m = render::mean(&sub, mask);
+                let cov = std::array::from_fn(|i| DOT_COV * (mask >> i & 1));
+                let bg = shade(&sub, &cov, m, tint_pct, color, backdrop);
+                marks.push((
+                    col,
+                    row,
+                    Some(Shape::Dots(mask)),
+                    ink(m, color, backdrop),
+                    bg,
+                ));
             }
         }
     }
@@ -251,7 +310,7 @@ fn write(
         w * 10,
         h * 10,
     );
-    let mut used: Vec<Shape> = marks.iter().map(|m| m.2).collect();
+    let mut used: Vec<Shape> = marks.iter().filter_map(|m| m.2).collect();
     used.sort_unstable();
     used.dedup();
     for shape in used {
@@ -279,8 +338,26 @@ fn write(
             }
         }
     }
-    let _ = writeln!(out, "</defs>\n<g fill=\"{ink}\">");
-    for &(col, row, shape, c) in marks {
+    out.extend_from_slice(b"</defs>\n");
+    if marks.iter().any(|m| m.4.is_some()) {
+        // Crisp edges, or antialiasing leaves hairline seams between cells.
+        // Each tint is its own path, not a `<use>`: Chrome instantiates every
+        // `<use>`, and a mural's worth took 10× longer to open.
+        out.extend_from_slice(b"<g shape-rendering=\"crispEdges\">\n");
+        for &(col, row, _, _, t) in marks {
+            if let Some((r, g, b)) = t {
+                let y = row * 2;
+                let _ = writeln!(
+                    out,
+                    "<path d=\"M{col} {y}h1v2h-1\" fill=\"#{r:02x}{g:02x}{b:02x}\"/>"
+                );
+            }
+        }
+        out.extend_from_slice(b"</g>\n");
+    }
+    let _ = writeln!(out, "<g fill=\"{ink}\">");
+    for &(col, row, shape, c, _) in marks {
+        let Some(shape) = shape else { continue };
         let (id, y) = (Id(shape), row * 2);
         let _ = write!(out, "<use href=\"#{id}\" x=\"{col}\" y=\"{y}\"");
         if let Some((r, g, b)) = c {
@@ -323,12 +400,62 @@ mod tests {
 
     fn svg_ascii(img: &[Rgb], color: ColorMode, bd: Backdrop, text: Option<&[u8]>) -> String {
         let mut out = Vec::new();
-        ascii(&mut solid(img), color, bd, Fit::Fill, text, &mut out);
+        ascii(&mut solid(img), color, bd, Fit::Fill, text, 0, &mut out);
         String::from_utf8(out).unwrap()
     }
 
     fn uses(s: &str) -> Vec<&str> {
         s.lines().filter(|l| l.starts_with("<use")).collect()
+    }
+
+    fn tints(s: &str) -> Vec<&str> {
+        s.lines().filter(|l| l.starts_with("<path d=")).collect()
+    }
+
+    fn svg_tinted(img: &[Rgb], color: ColorMode, text: Option<&[u8]>, pct: u32) -> String {
+        let mut out = Vec::new();
+        ascii(
+            &mut solid(img),
+            color,
+            LIGHT,
+            Fit::Fill,
+            text,
+            pct,
+            &mut out,
+        );
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn tint_is_off_at_zero() {
+        let s = svg_tinted(&[(20, 40, 60)], ColorMode::True, None, 0);
+        assert!(tints(&s).is_empty() && !s.contains("crispEdges"), "{s}");
+    }
+
+    #[test]
+    fn tint_is_a_fraction_of_the_ink() {
+        // A dark cell on paper: its glyph alone is too faint, so the cell is
+        // tinted at the cap, half the ink's depth (inverted, as on paper).
+        let s = svg_tinted(&[(20, 40, 60)], ColorMode::True, None, 50);
+        let (u, t) = (uses(&s), tints(&s));
+        assert_eq!((u.len(), t.len()), (1, 1), "{s}");
+        assert!(u[0].ends_with("fill=\"#14283c\"/>"), "{s}");
+        // 255 - (255 - c) / 2 per channel.
+        assert_eq!(t[0], "<path d=\"M0 0h1v2h-1\" fill=\"#8a949e\"/>");
+        // Tints sit under the glyphs, with crisp edges so cells don't seam.
+        assert!(s.find("crispEdges").unwrap() < s.find(&u[0][..20]).unwrap());
+    }
+
+    #[test]
+    fn tint_fills_word_spaces() {
+        let s = svg_tinted(&[(20, 40, 60); 3], ColorMode::True, Some(b"a "), 50);
+        assert_eq!((uses(&s).len(), tints(&s).len()), (2, 3), "{s}");
+    }
+
+    #[test]
+    fn gray_tint_is_gray() {
+        let s = svg_tinted(&[(0, 0, 0)], ColorMode::Gray, None, 50);
+        assert_eq!(tints(&s), ["<path d=\"M0 0h1v2h-1\" fill=\"#808080\"/>"]);
     }
 
     #[test]
@@ -524,6 +651,7 @@ mod tests {
             DARK,
             Fit::Natural,
             None,
+            0,
             &mut out,
         );
         let s = String::from_utf8(out).unwrap();
@@ -537,7 +665,7 @@ mod tests {
     fn braille_draws_lit_dots_as_circles() {
         let mut out = Vec::new();
         let mut img = solid(&[(255, 255, 255), (0, 0, 0)]);
-        braille(&mut img, ColorMode::True, 40, DARK, &mut out);
+        braille(&mut img, ColorMode::True, 40, DARK, 0, &mut out);
         let s = String::from_utf8(out).unwrap();
         assert_eq!(s.matches("<circle ").count(), 8, "{s}");
         assert!(
