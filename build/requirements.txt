@@ -1,0 +1,5 @@
+# For build/glyphs.py only (offline glyph data generation; not needed to build hype).
+# 4.60.2 is the last fontTools supporting Python 3.9, macOS's bundled python3.
+# Install: python3 -m venv build/.venv && build/.venv/bin/pip install --require-hashes --no-deps -r build/requirements.txt
+fonttools==4.60.2 \
+    --hash=sha256:73cf92eeda67cf6ff10c8af56fc8f4f07c1647d989a979be9e388a49be26552a

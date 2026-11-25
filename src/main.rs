@@ -1,3 +1,4 @@
+// -*- lexical-binding: t;-*-
 #[cfg(not(any(
     feature = "png",
     feature = "jpeg",
@@ -9,8 +10,12 @@ compile_error!("enable at least one image format feature (png, jpeg, gif, webp, 
 
 mod color;
 mod decode;
+#[cfg(feature = "svg")]
+mod recursive;
 mod render;
 mod resize;
+#[cfg(feature = "svg")]
+mod svg;
 mod term;
 
 use render::{ColorMode, Dither};
@@ -31,7 +36,7 @@ fn main() {
     };
 
     if opts.help {
-        print_help(opts.color);
+        print_help(opts.color, opts.light);
         return;
     }
     if opts.version {
@@ -85,20 +90,61 @@ fn main() {
     }
 
     let mut out = Vec::with_capacity(w * h * 12);
-    let px = &mut img.pixels;
-    match opts.mode {
-        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, opts.bg, &mut out),
-        Mode::Braille => {
-            render::render_braille(px, w, h, opts.color, opts.threshold, opts.bg, &mut out)
-        }
-        Mode::Ascii => match &text {
-            Some(t) => render::render_text(px, w, h, opts.color, opts.bg, t, &mut out),
-            None => render::render_ascii(px, w, h, opts.color, opts.bg, &mut out),
-        },
+    let bd = render::Backdrop {
+        bg: opts.bg,
+        light: opts.light,
+    };
+    if opts.svg {
+        svg_out(&mut img, &opts, bd, text.as_deref(), &mut out);
+    } else {
+        render_text_art(&mut img, &opts, bd, text.as_deref(), &mut out);
     }
     out.push(b'\n');
 
     emit(&out);
+}
+
+fn render_text_art(
+    img: &mut decode::Image,
+    opts: &Opts,
+    bd: render::Backdrop,
+    text: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) {
+    let (w, h, px) = (img.width, img.height, &mut img.pixels);
+    match opts.mode {
+        Mode::Block => render::render_block(px, w, h, opts.color, opts.dither, bd, out),
+        Mode::Braille => render::render_braille(px, w, h, opts.color, opts.threshold, bd, out),
+        Mode::Ascii => match text {
+            Some(t) => render::render_text(px, w, h, opts.color, bd, t, out),
+            None => render::render_ascii(px, w, h, opts.color, bd, out),
+        },
+    }
+}
+
+#[cfg(feature = "svg")]
+fn svg_out(
+    img: &mut decode::Image,
+    opts: &Opts,
+    bd: render::Backdrop,
+    text: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) {
+    match opts.mode {
+        Mode::Braille => svg::braille(img, opts.color, opts.threshold, bd, opts.tint, out),
+        _ => svg::ascii(img, opts.color, bd, text, opts.tint, out),
+    }
+}
+
+#[cfg(not(feature = "svg"))]
+fn svg_out(
+    _: &mut decode::Image,
+    _: &Opts,
+    _: render::Backdrop,
+    _: Option<&[u8]>,
+    _: &mut Vec<u8>,
+) {
+    unreachable!("parse_args rejects --svg without the svg feature");
 }
 
 fn open(path: &str, size: impl Fn(usize, usize) -> (usize, usize)) -> decode::Image {
@@ -143,7 +189,7 @@ fn fit_size(canvas_w: usize, canvas_h: usize, img_w: usize, img_h: usize) -> (us
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Block,
     Braille,
@@ -160,7 +206,11 @@ struct Opts {
     dither: Dither,
     threshold: u8,
     bg: Option<(u8, u8, u8)>,
+    light: bool,
     text: Option<String>,
+    svg: bool,
+    /// `--tint` strength, percent of the ink (0: off).
+    tint: u32,
     help: bool,
     version: bool,
 }
@@ -188,30 +238,46 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
         dither: Dither::None,
         threshold: 40,
         bg: None,
+        light: false,
         text: None,
+        svg: false,
+        tint: 0,
         help: false,
         version: false,
     };
     let mut mode = None;
+    let mut color = None;
+    let mut threshold_given = false;
+    // An optional value given bare (`--text`), and the positional argument
+    // right after one: tools differ on whether `--text FILE` works, so a
+    // hint if that was meant as its value.
+    let mut bare: Option<&str> = None;
+    let mut hint = None;
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        // A long option's value may be attached with '='; an optional value
+        // (--text, --tint) only can be, so it never takes the next word.
+        let (name, mut inline) = match args[i].split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (args[i].as_str(), None),
+        };
+        let after_bare = bare.take();
+        match name {
             "-h" | "--help" | "help" => opts.help = true,
             "-v" | "--version" => opts.version = true,
             "-l" | "--layer" => opts.layer = true,
             "-w" | "--width" => {
-                i += 1;
-                opts.width = Some(parse_num(args, i, "width")?);
+                let val = take(args, &mut i, &mut inline, "width")?;
+                opts.width = Some(parse_num(val, "width")?);
             }
             "-H" | "--height" => {
-                i += 1;
-                opts.height = Some(parse_num(args, i, "height")?);
+                let val = take(args, &mut i, &mut inline, "height")?;
+                opts.height = Some(parse_num(val, "height")?);
             }
             "-m" | "--mode" => {
-                i += 1;
-                let val = next_arg(args, i, "mode")?;
-                mode = Some(match val.as_str() {
+                let val = take(args, &mut i, &mut inline, "mode")?;
+                mode = Some(match val {
                     "block" => Mode::Block,
                     "braille" => Mode::Braille,
                     "ascii" => Mode::Ascii,
@@ -219,29 +285,38 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 });
             }
             "--text" => {
-                // Without a file (last, or followed by an option): stdin.
-                opts.text = Some(match args.get(i + 1) {
-                    Some(f) if f == "-" || !f.starts_with('-') => {
-                        i += 1;
-                        f.clone()
-                    }
-                    _ => "-".into(),
-                });
+                // Without a file: stdin.
+                let file = optional(&mut inline, "text")?;
+                if file.is_none() {
+                    bare = Some("--text");
+                }
+                opts.text = Some(file.unwrap_or("-").to_string());
             }
             "-c" | "--color" => {
-                i += 1;
-                let val = next_arg(args, i, "color")?;
-                opts.color = match val.as_str() {
+                let val = take(args, &mut i, &mut inline, "color")?;
+                color = Some(match val {
                     "true" => ColorMode::True,
                     "256" => ColorMode::Ansi256,
                     "gray" | "grey" => ColorMode::Gray,
                     _ => return Err(format!("unknown color mode '{val}' (true, 256, gray)")),
+                });
+            }
+            "--svg" => opts.svg = true,
+            "--tint" => {
+                opts.tint = match optional(&mut inline, "tint")? {
+                    Some(v) => match parse_num(v, "tint")? {
+                        n @ 0..=100 => n,
+                        _ => return Err("tint must be 0-100".into()),
+                    },
+                    None => {
+                        bare = Some("--tint");
+                        50
+                    }
                 };
             }
             "-d" | "--dither" => {
-                i += 1;
-                let val = next_arg(args, i, "dither")?;
-                opts.dither = match val.as_str() {
+                let val = take(args, &mut i, &mut inline, "dither")?;
+                opts.dither = match val {
                     "fs" => Dither::FloydSteinberg,
                     "ordered" => Dither::Ordered,
                     "none" => Dither::None,
@@ -249,52 +324,113 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 };
             }
             "-t" | "--threshold" => {
-                i += 1;
-                let n = parse_num::<u16>(args, i, "threshold")?;
+                let val = take(args, &mut i, &mut inline, "threshold")?;
+                let n = parse_num::<u16>(val, "threshold")?;
                 if n > 255 {
                     return Err("threshold must be 0-255".into());
                 }
                 opts.threshold = n as u8;
+                threshold_given = true;
             }
             "-b" | "--bg" => {
-                i += 1;
-                let val = next_arg(args, i, "bg")?;
-                opts.bg = Some(parse_bg(&val)?);
+                let val = take(args, &mut i, &mut inline, "bg")?;
+                opts.bg = Some(parse_bg(val)?);
             }
+            "--light" => opts.light = true,
             other => {
+                if let Some(flag) = after_bare {
+                    hint.get_or_insert(format!("{flag}={other}"));
+                }
                 if other.starts_with('-') {
-                    return Err(format!("unknown option '{other}'"));
+                    return Err(match (other, hint) {
+                        // `--text -`: stdin is bare --text, or --text=-.
+                        ("-", Some(h)) => format!("unknown option '-' (did you mean {h}?)"),
+                        _ => format!("unknown option '{other}'"),
+                    });
                 }
                 opts.images.push(other.to_string());
             }
+        }
+        if inline.is_some() {
+            return Err(format!("{name} takes no value"));
         }
         i += 1;
     }
     opts.mode = match (mode, &opts.text) {
         (None | Some(Mode::Ascii), Some(_)) => Mode::Ascii,
         (Some(_), Some(_)) => return Err("--text works in ascii mode only".into()),
+        // SVG draws ascii or braille, so it defaults to ascii.
+        (None, None) if opts.svg => Mode::Ascii,
         (m, None) => m.unwrap_or(Mode::Block),
     };
+    // Options that would have no effect are errors, not silently ignored.
+    if threshold_given && opts.mode != Mode::Braille {
+        return Err("--threshold works in braille mode only".into());
+    }
+    if opts.dither != Dither::None {
+        if opts.mode != Mode::Block {
+            return Err("--dither works in block mode only".into());
+        }
+        // Dithering is 256-color only, so asking for it selects 256 colors,
+        // whatever the terminal: the same command works everywhere.
+        match color.get_or_insert(ColorMode::Ansi256) {
+            ColorMode::Ansi256 => {}
+            _ => return Err("--dither works with -c 256 only".into()),
+        }
+    }
+    if opts.svg {
+        if !cfg!(feature = "svg") {
+            return Err("--svg is not in this build (cargo feature svg)".into());
+        }
+        if opts.mode == Mode::Block {
+            return Err("--svg draws ascii or braille mode, not block".into());
+        }
+        // A file has no terminal to detect: full color unless asked.
+        opts.color = color.unwrap_or(ColorMode::True);
+    } else if opts.tint > 0 {
+        return Err("--tint works with --svg only".into());
+    } else if let Some(c) = color {
+        opts.color = c;
+    }
     // Several images are only layered when asked for, so a stray argument or
     // an unexpected glob match stays an error.
     if let [_, extra, ..] = &opts.images[..]
         && !opts.layer
     {
-        return Err(format!(
-            "unexpected argument '{extra}' (use --layer to overlay images)"
-        ));
+        return Err(match hint {
+            // An optional value given after a space, as some tools allow.
+            Some(h) => format!("unexpected argument '{extra}' (did you mean {h}?)"),
+            None => format!("unexpected argument '{extra}' (use --layer to overlay images)"),
+        });
     }
     Ok(opts)
 }
 
-fn next_arg(args: &[String], i: usize, name: &str) -> Result<String, String> {
-    args.get(i)
-        .cloned()
+/// A required value: attached with '=', else the next argument.
+fn take<'a>(
+    args: &'a [String],
+    i: &mut usize,
+    inline: &mut Option<&'a str>,
+    name: &str,
+) -> Result<&'a str, String> {
+    if let Some(v) = optional(inline, name)? {
+        return Ok(v);
+    }
+    *i += 1;
+    args.get(*i)
+        .map(String::as_str)
         .ok_or_else(|| format!("missing value for --{name}"))
 }
 
-fn parse_num<T: std::str::FromStr>(args: &[String], i: usize, name: &str) -> Result<T, String> {
-    let val = next_arg(args, i, name)?;
+/// An optional value: only as attached with '=' (and then not empty).
+fn optional<'a>(inline: &mut Option<&'a str>, name: &str) -> Result<Option<&'a str>, String> {
+    match inline.take() {
+        Some("") => Err(format!("missing value for --{name}")),
+        v => Ok(v),
+    }
+}
+
+fn parse_num<T: std::str::FromStr>(val: &str, name: &str) -> Result<T, String> {
     val.parse::<T>()
         .map_err(|_| format!("invalid number for --{name}: '{val}'"))
 }
@@ -343,7 +479,7 @@ fn visible_width(s: &str) -> usize {
 /// Help text, shown beside the logo on a wide enough terminal. Style tags:
 /// `$h` heading, `$b` bold, `$a` argument, `$y` value, `$d` dim, `$0` reset.
 const HELP_TOP: &str = "\
-$bhype$0 {VERSION} \u{2014} images as high-fidelity terminal text art, fast
+$bhype$0 {VERSION} \u{2014} high-performance converter from images to high-fidelity terminal text art
 
 $hUsage:$0 $bhype$0 $a<IMAGE>$0 [OPTIONS]
        $bhype$0 $b--layer$0 $a<IMAGE>$0... [OPTIONS]
@@ -353,10 +489,13 @@ $hOptions:$0
   $b-H$0, $b--height$0 $a<N>$0      Height in rows $d(default: keep the image's aspect ratio)$0
   $b-m$0, $b--mode$0 $a<MODE>$0     $yblock$0, $ybraille$0, $yascii$0 $d(default: block)$0
   $b-c$0, $b--color$0 $a<MODE>$0    $ytrue$0, $y256$0, $ygray$0 $d(default: auto-detected, here {COLOR})$0
-  $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; 256-color block only)$0
-  $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots dimmer than N stay unlit $d(default: 40)$0
+  $b-d$0, $b--dither$0 $a<TYPE>$0   $yfs$0, $yordered$0, $ynone$0 $d(default: none; block, selects -c 256)$0
+  $b-t$0, $b--threshold$0 $a<N>$0   Braille: dots fainter than N stay unlit $d(default: 40)$0
   $b-b$0, $b--bg$0 $a<COLOR>$0      Flatten transparency onto $yblack$0, $ywhite$0 or $yR,G,B$0
-  $b--text$0 [$a<FILE>$0]       Draw the image with this text $d(stdin if - or none; implies ascii)$0
+  $b--light$0               Draw for a light background $d(light theme, or paper)$0
+  $b--text$0[=$a<FILE>$0]       Draw the image with this text $d(default: stdin; implies ascii)$0
+  $b--svg$0                 Vector SVG output, ascii or braille $d(default: ascii)$0
+  $b--tint$0[=$a<N>$0]          SVG: tint cells to carry tone glyphs can't $d(0-100, default 50)$0
   $b-l$0, $b--layer$0           Overlay further images, in order, on the first
   $b-h$0, $b--help$0, $bhelp$0      Show this help
   $b-v$0, $b--version$0         Show version
@@ -365,29 +504,31 @@ $hModes:$0
   $yblock$0     Half blocks and quadrants, two colors per cell. Highest fidelity.
   $ybraille$0   2x4 dots per cell in one color; unlit dots show the background.
   $yascii$0     Printable ASCII only: density ramp, shape-matched at edges.
-            With --text, the file's text in reading order instead, one
-            character per non-blank cell, the image carried by color.
+            With --text, the input text in reading order.
 ";
 
 const HELP_REST: &str = "
 $hOutput contract$0 $d(for scripts and agents)$0
-  - stdout carries only the image: one line per row, each exactly W columns
-    wide (UTF-8 with ANSI SGR color codes), then a final newline. No color
-    state carries over between lines, so lines can be used individually.
-  - Size: -w or -H alone sets that side and the other follows the image's
-    aspect ratio (cells are about twice as tall as wide); neither: terminal
-    width (80 if unknown). Both -w and -H given: stretch.
-  - With --layer, the first image sets the size; each later one is scaled
-    to fit inside it, keeping its aspect ratio, centered, and drawn over
-    the layers before it.
-  - With -w and -c given, output is deterministic for the same image.
-  - $b-c gray$0 in braille or ascii mode emits no escape codes at all.
-  - Transparent areas show the terminal background unless -b is given.
-  - --text collapses whitespace to single spaces, maps typographic quotes,
-    dashes and ellipses to ASCII, drops other non-ASCII, and repeats the
-    text if the image outlasts it.
-  - Errors: one line \"hype: <message>\" on stderr and exit status 1.
-    A reader closing the pipe early is not an error.
+  - Values: --opt V or --opt=V, -o V. Optional ones, shown [=...], only
+    with '=': the next word is never taken.
+  - stdout is only the image: one line per row, exactly W columns (UTF-8,
+    ANSI SGR colors), then a newline. No color state crosses lines.
+    $b-c gray$0 in braille or ascii emits no escape codes at all.
+  - Size: -w or -H alone sets that side, the other keeps the aspect ratio
+    (cells are about 1:2); neither: terminal width (80 if unknown); both:
+    stretch. With --layer, later images fit centered inside the first.
+  - Deterministic for the same image when -w and -c are given.
+  - Transparency shows the terminal background unless -b is given; it is
+    assumed dark, or light with --light. Braille and ascii leave areas
+    near it blank (-t measures faintness from it).
+  - --text: whitespace collapsed, punctuation made ASCII, other non-ASCII
+    dropped, repeated as needed. Gutenberg _italics_ lose the underscores
+    (and are italic in --svg).
+  - --svg ({SVG}): one SVG document, then a newline. 1x2-unit
+    cells, full color unless -c is given. Glyphs: Recursive (c) The
+    Recursive Project Authors, SIL OFL 1.1.
+  - Errors: one line \"hype: <message>\" on stderr, exit status 1, also for
+    options with no effect (e.g. -t outside braille). A closed pipe is not.
 
 $hFormats:$0     {FORMATS} $d(this build)$0
 $hEnvironment:$0 COLORTERM=truecolor or 24bit enables 24-bit color by default;
@@ -400,11 +541,12 @@ $hExamples:$0
   $bhype$0 logo.png -m ascii -c gray    $d# plain ASCII, no escape codes$0
   $bhype$0 logo.png -w 80 > logo.ans    $d# save now, show later with cat$0
   $bhype$0 -l frame.png icon.png        $d# icon centered over frame$0
-  $bhype$0 logo.png --text chapter.txt  $d# the image drawn in a book's words$0
+  $bhype$0 logo.png --text=chapter.txt  $d# the image drawn in a book's words$0
   $bfortune$0 | $bhype$0 logo.png --text    $d# ...or in piped text$0
+  $bhype$0 photo.jpg -w 200 --svg --light > print.svg  $d# vector art to print$0
 ";
 
-fn print_help(color: ColorMode) {
+fn print_help(color: ColorMode, light: bool) {
     // Styling and the logo are for humans at a terminal; captured output
     // (an agent or script) gets the same text without escape codes.
     let fancy = term::is_tty(1) && std::env::var_os("NO_COLOR").is_none();
@@ -426,7 +568,15 @@ fn print_help(color: ColorMode) {
         let mut s = text
             .replace("{VERSION}", VERSION)
             .replace("{COLOR}", detected)
-            .replace("{FORMATS}", &formats.join(", "));
+            .replace("{FORMATS}", &formats.join(", "))
+            .replace(
+                "{SVG}",
+                if cfg!(feature = "svg") {
+                    "in this build"
+                } else {
+                    "not in this build"
+                },
+            );
         for (tag, esc) in [
             ("$h", "\x1b[1;32m"),
             ("$b", "\x1b[1m"),
@@ -440,6 +590,7 @@ fn print_help(color: ColorMode) {
         s
     };
     let help = style(HELP_TOP) + &style(HELP_REST);
+    let bd = render::Backdrop { bg: None, light };
 
     let lines: Vec<&str> = help.lines().collect();
     let help_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
@@ -447,7 +598,7 @@ fn print_help(color: ColorMode) {
     let room = term::width().unwrap_or(80).saturating_sub(help_width + gap);
 
     let mut out = String::new();
-    match fancy.then(|| logo(room, lines.len(), color)).flatten() {
+    match fancy.then(|| logo(room, lines.len(), color, bd)).flatten() {
         Some(logo) => {
             // The logo is never taller than the help; center it beside it.
             let art: Vec<&str> = logo.lines().collect();
@@ -466,7 +617,7 @@ fn print_help(color: ColorMode) {
 /// The logo, rendered by hype itself as large as fits beside the help text:
 /// `cols` wide, unless that would be more than `rows` tall. None if there is
 /// too little room or this build lacks PNG.
-fn logo(cols: usize, rows: usize, color: ColorMode) -> Option<String> {
+fn logo(cols: usize, rows: usize, color: ColorMode, bd: render::Backdrop) -> Option<String> {
     if !cfg!(feature = "png") || cols < 16 {
         return None;
     }
@@ -481,7 +632,7 @@ fn logo(cols: usize, rows: usize, color: ColorMode) -> Option<String> {
     .ok()?;
     let (w, h) = (img.width, img.height);
     let mut out = Vec::new();
-    render::render_block(&mut img.pixels, w, h, color, Dither::None, None, &mut out);
+    render::render_block(&mut img.pixels, w, h, color, Dither::None, bd, &mut out);
     String::from_utf8(out).ok()
 }
 
@@ -511,22 +662,53 @@ mod tests {
         assert_eq!(opts.images, ["photo.png"]);
         assert!(!opts.help);
         assert!(!opts.version);
+        assert!(!opts.light);
     }
 
     #[test]
     fn parse_args_all_flags() {
         let a = args(&[
-            "img.jpg", "-w", "120", "-H", "40", "-m", "braille", "-c", "256", "-d", "fs", "-t",
-            "100", "-b", "white",
+            "img.jpg", "-w", "120", "-H", "40", "-m", "braille", "-c", "256", "-t", "100", "-b",
+            "white", "--light",
         ]);
         let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert!(opts.light);
         assert_eq!(opts.width, Some(120));
         assert_eq!(opts.height, Some(40));
         assert!(matches!(opts.mode, Mode::Braille));
         assert_eq!(opts.color, ColorMode::Ansi256);
-        assert_eq!(opts.dither, Dither::FloydSteinberg);
         assert_eq!(opts.threshold, 100);
         assert_eq!(opts.bg, Some((255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_args_rejects_options_without_effect() {
+        expect_err(&["img.png", "-t", "100"], "braille mode only");
+        expect_err(
+            &["img.png", "-m", "ascii", "-t", "100"],
+            "braille mode only",
+        );
+        expect_err(&["img.png", "-m", "braille", "-d", "fs"], "block mode only");
+        expect_err(&["img.png", "-d", "fs", "-c", "true"], "-c 256 only");
+        expect_err(&["img.png", "-d", "ordered", "-c", "gray"], "-c 256 only");
+        // -d none is the default, so it is always accepted.
+        let a = args(&["img.png", "-m", "braille", "-d", "none"]);
+        assert!(parse_args(&a, ColorMode::True).is_ok());
+    }
+
+    #[test]
+    fn parse_args_dither_selects_256() {
+        // Whatever the terminal, so the same command works everywhere.
+        for detected in [ColorMode::True, ColorMode::Gray, ColorMode::Ansi256] {
+            let opts = parse_args(&args(&["img.png", "-d", "fs"]), detected).unwrap();
+            assert_eq!(opts.color, ColorMode::Ansi256);
+            assert_eq!(opts.dither, Dither::FloydSteinberg);
+        }
+        let a = args(&["img.png", "-d", "ordered", "-c", "256"]);
+        assert_eq!(
+            parse_args(&a, ColorMode::True).unwrap().dither,
+            Dither::Ordered
+        );
     }
 
     #[test]
@@ -580,27 +762,125 @@ mod tests {
     #[test]
     fn parse_args_text_implies_ascii() {
         for a in [
-            &["img.png", "--text", "t.txt"][..],
-            &["--text", "t.txt", "-m", "ascii", "img.png"],
+            &["img.png", "--text=t.txt"][..],
+            &["--text=t.txt", "-m", "ascii", "img.png"],
         ] {
             let opts = parse_args(&args(a), ColorMode::True).unwrap();
             assert!(matches!(opts.mode, Mode::Ascii));
             assert_eq!(opts.text.as_deref(), Some("t.txt"));
         }
         expect_err(
-            &["img.png", "--text", "t.txt", "-m", "block"],
+            &["img.png", "--text=t.txt", "-m", "block"],
             "ascii mode only",
         );
-        // No file, or "-": stdin.
+        // No file, or "-": stdin. The next word is never taken, even before
+        // the image.
         for a in [
             &["img.png", "--text"][..],
             &["img.png", "--text", "-w", "40"],
-            &["--text", "-", "img.png"],
+            &["--text=-", "img.png"],
+            &["--text", "img.png"],
         ] {
             let opts = parse_args(&args(a), ColorMode::True).unwrap();
             assert_eq!(opts.text.as_deref(), Some("-"));
             assert_eq!(opts.images, ["img.png"]);
         }
+        // A file after a space is not the text's but a second image, with a
+        // hint, as other tools differ: wherever the real image is.
+        expect_err(
+            &["img.png", "--text", "t.txt"],
+            "unexpected argument 't.txt' (did you mean --text=t.txt?)",
+        );
+        expect_err(
+            &["--text", "t.txt", "img.png"],
+            "unexpected argument 'img.png' (did you mean --text=t.txt?)",
+        );
+        expect_err(
+            &["img.png", "--text", "-"],
+            "unknown option '-' (did you mean --text=-?)",
+        );
+        // Without a bare --text before it, no hint.
+        expect_err(&["a.png", "b.png"], "use --layer");
+        expect_err(&["img.png", "--text="], "missing value for --text");
+    }
+
+    #[test]
+    fn parse_args_long_values_with_equals() {
+        let a = args(&[
+            "--width=120",
+            "--height=40",
+            "--mode=braille",
+            "--color=256",
+            "--threshold=100",
+            "--bg=1,2,3",
+            "img.png",
+        ]);
+        let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert_eq!((opts.width, opts.height), (Some(120), Some(40)));
+        assert!(opts.mode == Mode::Braille);
+        assert_eq!(opts.color, ColorMode::Ansi256);
+        assert_eq!(opts.threshold, 100);
+        assert_eq!(opts.bg, Some((1, 2, 3)));
+        let a = args(&["--dither=ordered", "img.png"]);
+        assert_eq!(
+            parse_args(&a, ColorMode::True).unwrap().dither,
+            Dither::Ordered
+        );
+        // Only long options take '='; flags take no value at all.
+        expect_err(&["img.png", "-w=40"], "unknown option '-w=40'");
+        expect_err(&["img.png", "--light=yes"], "--light takes no value");
+        expect_err(&["img.png", "--width="], "missing value for --width");
+        expect_err(&["img.png", "--bogus=1"], "unknown option '--bogus'");
+        // A file name may contain '='.
+        let opts = parse_args(&args(&["a=b.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.images, ["a=b.png"]);
+    }
+
+    #[cfg(feature = "svg")]
+    #[test]
+    fn parse_args_svg() {
+        let opts = parse_args(&args(&["img.png", "--svg"]), ColorMode::Ansi256).unwrap();
+        assert!(opts.svg);
+        // Ascii by default, and full color rather than the terminal's.
+        assert!(opts.mode == Mode::Ascii);
+        assert_eq!(opts.color, ColorMode::True);
+        // It takes no value: a following word is an image.
+        expect_err(&["img.png", "--svg", "natural"], "unexpected argument");
+        let a = args(&[
+            "--svg", "img.png", "-m", "braille", "-c", "gray", "-t", "60",
+        ]);
+        let opts = parse_args(&a, ColorMode::True).unwrap();
+        assert!(opts.mode == Mode::Braille);
+        assert_eq!(opts.color, ColorMode::Gray);
+        assert_eq!(opts.threshold, 60);
+        expect_err(&["img.png", "--svg", "-m", "block"], "not block");
+        expect_err(&["img.png", "--svg", "-d", "fs"], "block mode only");
+        expect_err(&["img.png", "--svg=fill"], "--svg takes no value");
+        // --tint: off unless given, 50 without a number.
+        assert_eq!(opts.tint, 0);
+        let opts = parse_args(&args(&["--svg", "--tint", "img.png"]), ColorMode::True).unwrap();
+        assert_eq!(
+            (opts.tint, &opts.images[..]),
+            (50, &["img.png".to_string()][..])
+        );
+        let opts = parse_args(&args(&["--svg", "--tint=30", "x.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.tint, 30);
+        expect_err(&["img.png", "--svg", "--tint=101"], "0-100");
+        expect_err(
+            &["img.png", "--svg", "--tint=x"],
+            "invalid number for --tint",
+        );
+        expect_err(
+            &["img.png", "--svg", "--tint", "30"],
+            "unexpected argument '30' (did you mean --tint=30?)",
+        );
+        expect_err(&["img.png", "--tint"], "--svg only");
+    }
+
+    #[cfg(not(feature = "svg"))]
+    #[test]
+    fn parse_args_svg_needs_feature() {
+        expect_err(&["img.png", "--svg"], "not in this build");
     }
 
     #[test]
