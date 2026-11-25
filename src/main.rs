@@ -290,7 +290,7 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
                 if file.is_none() {
                     bare = Some("--text");
                 }
-                opts.text = Some(file.unwrap_or("-").to_string());
+                opts.text = Some(home(file.unwrap_or("-")));
             }
             "-c" | "--color" => {
                 let val = take(args, &mut i, &mut inline, "color")?;
@@ -406,6 +406,15 @@ fn parse_args(args: &[String], default_color: ColorMode) -> Result<Opts, String>
     Ok(opts)
 }
 
+/// `path` with a leading `~/` expanded to $HOME. Shells expand `~` only at
+/// the start of a word, so `--text=~/book.txt` arrives unexpanded.
+fn home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// A required value: attached with '=', else the next argument.
 fn take<'a>(
     args: &'a [String],
@@ -510,7 +519,7 @@ $hModes:$0
 const HELP_REST: &str = "
 $hOutput contract$0 $d(for scripts and agents)$0
   - Values: --opt V or --opt=V, -o V. Optional ones, shown [=...], only
-    with '=': the next word is never taken.
+    with '=': the next word is never taken. --text=~/f expands the ~.
   - stdout is only the image: one line per row, exactly W columns (UTF-8,
     ANSI SGR colors), then a newline. No color state crosses lines.
     $b-c gray$0 in braille or ascii emits no escape codes at all.
@@ -802,6 +811,12 @@ mod tests {
         // Without a bare --text before it, no hint.
         expect_err(&["a.png", "b.png"], "use --layer");
         expect_err(&["img.png", "--text="], "missing value for --text");
+        // A leading ~/ is expanded, as the shell leaves it after '='.
+        let home = std::env::var("HOME").unwrap();
+        let opts = parse_args(&args(&["--text=~/t.txt", "img.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.text, Some(format!("{home}/t.txt")));
+        let opts = parse_args(&args(&["--text=a~/t.txt", "img.png"]), ColorMode::True).unwrap();
+        assert_eq!(opts.text.as_deref(), Some("a~/t.txt"));
     }
 
     #[test]
