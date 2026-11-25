@@ -12,37 +12,24 @@
 //! glyph, so dark (on paper) areas get heavy strokes and light ones regular.
 //! `--text` italics (`render::ITALIC`) use Recursive's true italics.
 
-use crate::Fit;
 use crate::color::{ansi256_rgb, nearest_ansi256};
 use crate::decode::Image;
-use crate::recursive::{
-    FILL_TRANSFORM, ITALIC_FILL, ITALIC_NATURAL, ITALIC_PATHS, NATURAL_TRANSFORM, OTHER_FILL,
-    OTHER_NATURAL, PATHS, RAMP_FILL, RAMP_NATURAL, WEIGHTS,
-};
+// RAMP is the density ramp of all weights, as `render::GLYPHS` is for the
+// terminal; OTHER and ITALICS are every other printable glyph at each
+// weight, upright and italic, for `--text`. TRANSFORM maps outlines onto the
+// 1×2 cell, precomputed as text: formatting floats here added 13 KB of code.
+use crate::recursive::{ITALIC_PATHS, ITALICS, OTHER, PATHS, RAMP, TRANSFORM, WEIGHTS};
 use crate::render::{self, Backdrop, ColorMode, Pixel, Rgb};
 use std::io::Write;
 
 /// A glyph, labeled (character, index into `WEIGHTS`), and its coverage.
 type Glyph = ((u8, u8), [u8; 8]);
 
-/// The coverage tables for one fit.
-struct Tables {
-    /// The density ramp of all weights, as `render::GLYPHS` is for the
-    /// terminal.
-    ramp: &'static [Glyph],
-    /// Every other printable glyph at each weight, for `--text`.
-    other: &'static [Glyph],
-    /// Every printable italic glyph at each weight, for `--text`.
-    italic: &'static [Glyph],
-    /// `render::ref_ink` for each weight, upright and italic: text in a
-    /// cell is shown as bright as an average lowercase letter of the weight
-    /// and style drawn there.
-    ref_ink: [u32; WEIGHTS.len()],
-    italic_ref_ink: [u32; WEIGHTS.len()],
-    /// Maps glyph outlines onto the 1×2 cell. Precomputed as text:
-    /// formatting floats here added 13 KB of code.
-    transform: &'static str,
-}
+/// `render::ref_ink` for each weight, upright and italic: text in a cell is
+/// shown as bright as an average lowercase letter of the weight and style
+/// drawn there.
+const REF_INK: [u32; WEIGHTS.len()] = ref_inks(&RAMP);
+const ITALIC_REF_INK: [u32; WEIGHTS.len()] = ref_inks(&ITALICS);
 
 /// Total ink of an average lowercase letter at each weight in `ramp`.
 const fn ref_inks(ramp: &[Glyph]) -> [u32; WEIGHTS.len()] {
@@ -68,24 +55,6 @@ const fn ref_inks(ramp: &[Glyph]) -> [u32; WEIGHTS.len()] {
     }
     sums
 }
-
-const NATURAL: Tables = Tables {
-    ramp: &RAMP_NATURAL,
-    other: &OTHER_NATURAL,
-    italic: &ITALIC_NATURAL,
-    ref_ink: ref_inks(&RAMP_NATURAL),
-    italic_ref_ink: ref_inks(&ITALIC_NATURAL),
-    transform: NATURAL_TRANSFORM,
-};
-
-const FILLED: Tables = Tables {
-    ramp: &RAMP_FILL,
-    other: &OTHER_FILL,
-    italic: &ITALIC_FILL,
-    ref_ink: ref_inks(&RAMP_FILL),
-    italic_ref_ink: ref_inks(&ITALIC_FILL),
-    transform: FILL_TRANSFORM,
-};
 
 /// Braille dot radius, in cells (a subpixel is 0.5 across).
 const DOT_R: &str = "0.22";
@@ -165,15 +134,10 @@ pub fn ascii(
     img: &mut Image,
     color: ColorMode,
     backdrop: Backdrop,
-    fit: Fit,
     text: Option<&[u8]>,
     tint_pct: u32,
     out: &mut Vec<u8>,
 ) {
-    let t = match fit {
-        Fit::Fill => &FILLED,
-        Fit::Natural => &NATURAL,
-    };
     render::flatten(&mut img.pixels, backdrop);
     let mut text = text.map(|s| s.iter().copied().cycle());
     let (cols, rows) = (img.width / 2, img.height / 4);
@@ -181,7 +145,7 @@ pub fn ascii(
     for row in 0..rows {
         for col in 0..cols {
             let sub = render::cell(&img.pixels, img.width, col, row);
-            let &(g, cov) = render::ascii_glyph(&sub, t.ramp);
+            let &(g, cov) = render::ascii_glyph(&sub, &RAMP);
             if g.0 == b' ' {
                 continue;
             }
@@ -202,9 +166,9 @@ pub fn ascii(
                         continue;
                     }
                     let (refs, table) = if italic {
-                        (&t.italic_ref_ink, t.italic)
+                        (&ITALIC_REF_INK, &ITALICS[..])
                     } else {
-                        (&t.ref_ink, t.other)
+                        (&REF_INK, &OTHER[..])
                     };
                     // The weight whose average letter has the ink closest to
                     // what ascii mode puts here, so tone follows ascii mode
@@ -216,7 +180,7 @@ pub fn ascii(
                     // Every printable glyph is measured at each weight and
                     // style; all have some ink.
                     let g = (ch, w as u8);
-                    let upright = if italic { &[][..] } else { t.ramp };
+                    let upright = if italic { &[][..] } else { &RAMP[..] };
                     let (_, cov) = upright.iter().chain(table).find(|x| x.0 == g).unwrap();
                     let c = render::compensate(render::ink_mean(&sub, cov), cov, refs[w]);
                     let shape = if italic {
@@ -231,7 +195,7 @@ pub fn ascii(
             marks.push((col, row, shape, ink(c, color, backdrop), bg));
         }
     }
-    write(out, cols, rows, &marks, backdrop, t);
+    write(out, cols, rows, &marks, backdrop);
 }
 
 /// `tint`, drawn as `ink` draws colors; in gray the ink is solid, so the
@@ -283,18 +247,11 @@ pub fn braille(
             }
         }
     }
-    write(out, cols, rows, &marks, backdrop, &NATURAL);
+    write(out, cols, rows, &marks, backdrop);
 }
 
 /// The SVG document: background, the shapes used, then the marks.
-fn write(
-    out: &mut Vec<u8>,
-    cols: usize,
-    rows: usize,
-    marks: &[Mark],
-    backdrop: Backdrop,
-    t: &Tables,
-) {
+fn write(out: &mut Vec<u8>, cols: usize, rows: usize, marks: &[Mark], backdrop: Backdrop) {
     let (paper, ink) = if backdrop.light {
         ("#fff", "#000")
     } else {
@@ -324,8 +281,7 @@ fn write(
                 let id = Id(shape);
                 let _ = writeln!(
                     out,
-                    "<path id=\"{id}\" transform=\"{}\" d=\"{d}\"/>",
-                    t.transform
+                    "<path id=\"{id}\" transform=\"{TRANSFORM}\" d=\"{d}\"/>"
                 );
             }
             Shape::Dots(mask) => {
@@ -400,7 +356,7 @@ mod tests {
 
     fn svg_ascii(img: &[Rgb], color: ColorMode, bd: Backdrop, text: Option<&[u8]>) -> String {
         let mut out = Vec::new();
-        ascii(&mut solid(img), color, bd, Fit::Fill, text, 0, &mut out);
+        ascii(&mut solid(img), color, bd, text, 0, &mut out);
         String::from_utf8(out).unwrap()
     }
 
@@ -414,15 +370,7 @@ mod tests {
 
     fn svg_tinted(img: &[Rgb], color: ColorMode, text: Option<&[u8]>, pct: u32) -> String {
         let mut out = Vec::new();
-        ascii(
-            &mut solid(img),
-            color,
-            LIGHT,
-            Fit::Fill,
-            text,
-            pct,
-            &mut out,
-        );
+        ascii(&mut solid(img), color, LIGHT, text, pct, &mut out);
         String::from_utf8(out).unwrap()
     }
 
@@ -467,7 +415,7 @@ mod tests {
         // The bright cell gets the densest glyph; the black cell is blank.
         let u = uses(&s);
         assert_eq!(u.len(), 1, "{s}");
-        let dense = Id(Shape::Glyph(RAMP_FILL.last().unwrap().0));
+        let dense = Id(Shape::Glyph(RAMP.last().unwrap().0));
         assert_eq!(
             u[0],
             format!("<use href=\"#{dense}\" x=\"0\" y=\"0\" fill=\"#ffffff\"/>")
@@ -605,7 +553,7 @@ mod tests {
             .1;
         assert!(
             s.contains(&format!(
-                "<path id=\"i{top}-98\" transform=\"{FILL_TRANSFORM}\" d=\"{d}\"/>"
+                "<path id=\"i{top}-98\" transform=\"{TRANSFORM}\" d=\"{d}\"/>"
             )),
             "{s}"
         );
@@ -620,45 +568,26 @@ mod tests {
     }
 
     #[test]
-    fn fits_map_their_box_onto_the_cell() {
-        // Each fit's box corners (font units, cell-local) land on the 1×2
-        // cell's corners: natural is the whole 600×1200 cell, fill the box
-        // from (30, 190) to (570, 1150). Path data is in half font units.
-        for (tr, (x0, y0, x1, y1)) in [
-            (NATURAL_TRANSFORM, (0.0, 0.0, 600.0, 1200.0)),
-            (FILL_TRANSFORM, (30.0, 190.0, 570.0, 1150.0)),
-        ] {
-            let m: Vec<f64> = tr
-                .strip_prefix("matrix(")
-                .and_then(|s| s.strip_suffix(')'))
-                .unwrap()
-                .split(' ')
-                .map(|v| v.parse().unwrap())
-                .collect();
-            let at = |x: f64, y: f64| (m[0] * 2.0 * x + m[4], m[3] * 2.0 * y + m[5]);
-            let near = |(a, b): (f64, f64), (c, d): (f64, f64)| {
-                (a - c).abs() < 1e-9 && (b - d).abs() < 1e-9 && m[1] == 0.0 && m[2] == 0.0
-            };
-            assert!(near(at(x0, y0), (0.0, 0.0)), "{tr}");
-            assert!(near(at(x1, y1), (1.0, 2.0)), "{tr}");
-        }
-        // And the fit chooses which one the glyphs use.
-        let mut out = Vec::new();
-        let white = &[(255, 255, 255)];
-        ascii(
-            &mut solid(white),
-            ColorMode::True,
-            DARK,
-            Fit::Natural,
-            None,
-            0,
-            &mut out,
-        );
-        let s = String::from_utf8(out).unwrap();
-        assert!(
-            s.contains(&format!("transform=\"{NATURAL_TRANSFORM}\"")),
-            "{s}"
-        );
+    fn transform_maps_the_fill_box_onto_the_cell() {
+        // The fill box's corners (font units, cell-local), (30, 190) and
+        // (570, 1150), land on the 1×2 cell's corners. Path data is in half
+        // font units.
+        let m: Vec<f64> = TRANSFORM
+            .strip_prefix("matrix(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap()
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let at = |x: f64, y: f64| (m[0] * 2.0 * x + m[4], m[3] * 2.0 * y + m[5]);
+        let near = |(a, b): (f64, f64), (c, d): (f64, f64)| {
+            (a - c).abs() < 1e-9 && (b - d).abs() < 1e-9 && m[1] == 0.0 && m[2] == 0.0
+        };
+        assert!(near(at(30.0, 190.0), (0.0, 0.0)), "{TRANSFORM}");
+        assert!(near(at(570.0, 1150.0), (1.0, 2.0)), "{TRANSFORM}");
+        // And the glyphs use it.
+        let s = svg_ascii(&[(255, 255, 255)], ColorMode::True, DARK, None);
+        assert!(s.contains(&format!("transform=\"{TRANSFORM}\"")), "{s}");
     }
 
     #[test]

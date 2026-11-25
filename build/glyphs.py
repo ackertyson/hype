@@ -63,8 +63,10 @@ EMIT_WEIGHTS = [400, 600, 800, 875, 1000]
 # assumes. Outlines are emitted cell-local: origin at the top-left, y down.
 CELL_W, CELL_H, ASCENDER = 600, 1200, 950
 # Geometries map a box within the cell onto the cell: (x, y, w, h), cell-local.
+# Only EMIT_GEOMETRY is emitted; the others are for the report.
 GEOMETRIES = {
-    # As the font sets type: the whole line height.
+    # As the font sets type: the whole line height. Its gutters leave even the
+    # densest glyph a narrow tonal range, so it is not emitted.
     "natural": (0, 0, CELL_W, CELL_H),
     # Glyphs enlarged to fill the cell: from the descender of p/q/y (-200) to
     # the top of | { } (760), and x 30..570 (W's ink reaches 23..575). Shown
@@ -72,6 +74,7 @@ GEOMETRIES = {
     # reaching beyond (g, $) overlap their neighbors slightly.
     "fill": (30, ASCENDER - 760, 540, 960),
 }
+EMIT_GEOMETRY = "fill"
 # Path data units per font unit: outlines are whole font units, but implied
 # curve midpoints fall on halves, so doubling makes every number whole
 # (measured 9% smaller path data). The SVG transforms scale back.
@@ -430,27 +433,29 @@ def emit(path, outlines, cov, italic, italic_cov, ramp):
         f"// The cell in font units is {CELL_W}x{CELL_H}: the advance width by the line height.",
         "",
     ]
-    for geo, (bx, by, bw, bh) in GEOMETRIES.items():
-        # SVG transform mapping the geometry's box onto a 1x2-unit cell.
-        sx, sy = 1 / bw, 2 / bh
-        # Path data is in PATH_UNITS per font unit; the translation is not.
-        tx, ty = -bx * sx, -by * sy
-        sx, sy = sx / PATH_UNITS, sy / PATH_UNITS
-        decl = f"pub const {geo.upper()}_TRANSFORM: &str ="
-        value = f'"matrix({sx!r} 0 0 {sy!r} {tx!r} {ty!r})";'
-        # rustfmt moves a value that overflows 100 columns to its own line,
-        # if it fits there.
-        if len(decl) + 1 + len(value) > 100 and 4 + len(value) <= 100:
-            lines = [decl, "    " + value]
-        else:
-            lines = [decl + " " + value]
-        out += [
-            f"/// Maps the {geo} geometry's box (x {bx}, y {by}, {bw}x{bh} font units,",
-            f"/// cell-local; path data is in {PATH_UNITS} units per font unit) onto a",
-            "/// 1x2-unit cell, as an SVG transform.",
-            *lines,
-            "",
-        ]
+    geo = EMIT_GEOMETRY
+    bx, by, bw, bh = GEOMETRIES[geo]
+    # SVG transform mapping the geometry's box onto a 1x2-unit cell.
+    sx, sy = 1 / bw, 2 / bh
+    # Path data is in PATH_UNITS per font unit; the translation is not.
+    tx, ty = -bx * sx, -by * sy
+    sx, sy = sx / PATH_UNITS, sy / PATH_UNITS
+    decl = "pub const TRANSFORM: &str ="
+    value = f'"matrix({sx!r} 0 0 {sy!r} {tx!r} {ty!r})";'
+    # rustfmt moves a value that overflows 100 columns to its own line, if it
+    # fits there.
+    if len(decl) + 1 + len(value) > 100 and 4 + len(value) <= 100:
+        lines = [decl, "    " + value]
+    else:
+        lines = [decl + " " + value]
+    out += [
+        f"/// Maps the {geo} geometry's box (x {bx}, y {by}, {bw}x{bh} font units,",
+        f"/// cell-local; path data is in {PATH_UNITS} units per font unit) onto a",
+        "/// 1x2-unit cell, as an SVG transform. Glyphs are enlarged to fill the",
+        "/// cell, for more ink and so a wider tonal range.",
+        *lines,
+        "",
+    ]
     # Glyphs are labeled (char, weight index), the index into WEIGHTS.
     weights = ", ".join(map(str, EMIT_WEIGHTS))
     out += [
@@ -472,61 +477,59 @@ def emit(path, outlines, cov, italic, italic_cov, ramp):
         italic,
     )
     printable = [chr(c) for c in range(32, 127)]
-    for geo in GEOMETRIES:
-        # One scale per geometry, shared by all weights and styles so heavier
-        # glyphs keep their extra ink: the densest subpixel reads as 255.
-        scale = 255 / max(
-            v
-            for w in EMIT_WEIGHTS
-            for t in (cov[geo, w], italic_cov[geo, w])
-            for c in printable
-            for v in t[c]
+    # One scale, shared by all weights and styles so heavier glyphs keep
+    # their extra ink: the densest subpixel reads as 255.
+    scale = 255 / max(
+        v
+        for w in EMIT_WEIGHTS
+        for t in (cov[geo, w], italic_cov[geo, w])
+        for c in printable
+        for v in t[c]
+    )
+    # One ramp of every weight's glyphs, so the density ramp and shape
+    # matching choose the weight along with the glyph. A blank is a blank at
+    # any weight: just one space.
+    merged = [
+        (c, wi, cov[geo, w][c])
+        for wi, w in enumerate(EMIT_WEIGHTS)
+        for c in ramp
+        if c != " " or wi == 0
+    ]
+    merged.sort(key=lambda e: (mean(e[2]), e[0], e[1]))
+    others = [(c, wi, cov[geo, w][c]) for wi, w in enumerate(EMIT_WEIGHTS) for c in other]
+    out.append(
+        rust_table(
+            "RAMP",
+            merged,
+            scale,
+            f"The ASCII ramp of all weights, by mean coverage, in the {geo} geometry.",
         )
-        # One ramp of every weight's glyphs, so the density ramp and shape
-        # matching choose the weight along with the glyph. A blank is a
-        # blank at any weight: just one space.
-        merged = [
-            (c, wi, cov[geo, w][c])
-            for wi, w in enumerate(EMIT_WEIGHTS)
-            for c in ramp
-            if c != " " or wi == 0
-        ]
-        merged.sort(key=lambda e: (mean(e[2]), e[0], e[1]))
-        others = [(c, wi, cov[geo, w][c]) for wi, w in enumerate(EMIT_WEIGHTS) for c in other]
-        g = geo.upper()
-        out.append(
-            rust_table(
-                f"RAMP_{g}",
-                merged,
-                scale,
-                f"The ASCII ramp of all weights, by mean coverage, in the {geo} geometry.",
-            )
+    )
+    out.append("")
+    out.append(
+        rust_table(
+            "OTHER",
+            others,
+            scale,
+            "The other printable ASCII glyphs at each weight, same scale (for --text).",
         )
-        out.append("")
-        out.append(
-            rust_table(
-                f"OTHER_{g}",
-                others,
-                scale,
-                "The other printable ASCII glyphs at each weight, same scale (for --text).",
-            )
+    )
+    out.append("")
+    italics = [
+        (c, wi, italic_cov[geo, w][c])
+        for wi, w in enumerate(EMIT_WEIGHTS)
+        for c in printable
+        if c != " "
+    ]
+    out.append(
+        rust_table(
+            "ITALICS",
+            italics,
+            scale,
+            f"Every printable italic glyph at each weight, same scale, in the {geo} geometry.",
         )
-        out.append("")
-        italics = [
-            (c, wi, italic_cov[geo, w][c])
-            for wi, w in enumerate(EMIT_WEIGHTS)
-            for c in printable
-            if c != " "
-        ]
-        out.append(
-            rust_table(
-                f"ITALIC_{g}",
-                italics,
-                scale,
-                f"Every printable italic glyph at each weight, same scale, in the {geo} geometry.",
-            )
-        )
-        out.append("")
+    )
+    out.append("")
     path.write_text("\n".join(out))
     print(f"\nwrote {path.relative_to(ROOT)} ({path.stat().st_size} bytes)")
 
